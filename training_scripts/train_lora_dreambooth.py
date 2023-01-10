@@ -21,9 +21,12 @@ from accelerate.utils import set_seed
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    StableDiffusionPipeline,
-    UNet2DConditionModel,
+    #StableDiffusionPipeline,
+    #UNet2DConditionModel,
 )
+from ..diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
+from ..diffusers.models.unet_2d_condition import UNet2DConditionModel
+
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 
@@ -144,6 +147,79 @@ class DreamBoothDataset(Dataset):
 
         return example
 
+class SegMapDataset(DreamBoothDataset):
+
+    def __init__(self,
+        instance_data_root,
+        instance_segmap_data_root,
+        instance_prompt,
+        tokenizer,
+        class_data_root=None,
+        class_prompt=None,
+        size=512,
+        center_crop=False,
+        color_jitter=False,
+    ):
+        super().__init__(instance_data_root,
+                        instance_prompt,
+                        tokenizer,
+                        class_data_root,
+                        class_prompt,
+                        size,
+                        center_crop,
+                        color_jitter)
+
+        self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
+        self.instance_segmap_data_root = instance_segmap_data_root
+
+    def __getitem__(self, index):
+        example = {}
+        img_path = self.instance_images_path[index % self.num_instance_images]
+        _, img_name = os.path.split(img_path)
+        instance_image = Image.open(
+            #self.instance_images_path[index % self.num_instance_images]
+            img_path
+        )
+        ## Segmap
+        img_name, _ = os.path.splitext(img_name)
+        segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.jpg')
+        segmap_instance_image = Image.open(segmap_img_path)
+        
+        if not instance_image.mode == "RGB":
+            instance_image = instance_image.convert("RGB")
+            segmap_instance_image = segmap_instance_image.convert("RGB")    
+
+        example["instance_images"] = self.image_transforms(instance_image)
+        example["instance_segmap_images"] = self.image_transforms(segmap_instance_image)
+
+        example["instance_prompt_ids"] = self.tokenizer(
+            self.instance_prompt,
+            padding="do_not_pad",
+            truncation=True,
+            max_length=self.tokenizer.model_max_length,
+        ).input_ids
+
+        if self.class_data_root:
+            class_image = Image.open(
+                self.class_images_path[index % self.num_class_images]
+            )
+            if not class_image.mode == "RGB":
+                class_image = class_image.convert("RGB")
+            example["class_images"] = self.image_transforms(class_image)
+            example["class_prompt_ids"] = self.tokenizer(
+                self.class_prompt,
+                padding="do_not_pad",
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+            ).input_ids
+
+        # segmap_instance_image = Image.open(
+        #     self.instance_segmap_images_path[index % self.num_instance_images]
+        # )
+        # TODO check if conversion to RGB needed for more complex seg maps
+        # example["instance_segmap_images"] = self.image_transforms(segmap_instance_image)
+
+        return example
 
 class PromptDataset(Dataset):
     "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
@@ -199,6 +275,20 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="A folder containing the training data of instance images.",
+    )
+    parser.add_argument(
+        "--instance_segmap_data_root",
+        type=str,
+        default=None,
+        required=False,
+        help="A folder containing the training data of segmentation maps for instance images.",   
+    )
+    parser.add_argument(
+        "--train_unet_segmentation",
+        default=False,
+        required=False,
+        action="store_true",
+        help="add extra channels to unet model for segmentation and train them",
     )
     parser.add_argument(
         "--class_data_dir",
