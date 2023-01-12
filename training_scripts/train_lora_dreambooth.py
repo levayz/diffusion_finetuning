@@ -24,8 +24,12 @@ from diffusers import (
     #StableDiffusionPipeline,
     #UNet2DConditionModel,
 )
-from ..diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from ..diffusers.models.unet_2d_condition import UNet2DConditionModel
+import sys
+sys.path.append('/home/Lev/Projects/diffusion_finetuning/') # Need this to import files from the diffusers folder
+print(sys.path)
+
+from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
+from diffusers.models.unet_2d_condition import UNet2DConditionModel
 
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
@@ -50,7 +54,10 @@ from pathlib import Path
 import random
 import re
 
-
+from torch.utils.tensorboard import SummaryWriter
+import functools
+import operator
+            
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -289,6 +296,13 @@ def parse_args(input_args=None):
         required=False,
         action="store_true",
         help="add extra channels to unet model for segmentation and train them",
+    )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        required=False,
+        help="run name for TesnorBoard",
     )
     parser.add_argument(
         "--class_data_dir",
@@ -575,14 +589,12 @@ def parse_args(input_args=None):
 
 def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with="tensorboard",
         logging_dir=logging_dir,
     )
-
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
     # TODO (patil-suraj): Remove this check when gradient accumulation with two models is enabled in accelerate.
@@ -687,9 +699,29 @@ def main(args):
         unet, r=args.lora_rank, loras=args.resume_unet
     )
 
+    # double the channels of the last layer of unet and set them to require_grad_(True)
+    n_noise_pred_channels = unet.conv_out.out_channels
+    if args.train_unet_segmentation:
+        tmp = unet.conv_out
+        new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
+        new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
+        
+        unet.conv_out = new_layer
+        unet.conv_out.weight.data.requires_grad_(False)
+        unet.conv_out.weight.data[-tmp.out_channels:, :, :, :].requires_grad_(True)
+
+        # Add a fc layer with softmax to the added channels
+        n_features =  4 * 64 * 64
+        segnet = torch.nn.Sequential(
+            torch.nn.Linear(n_features, n_features),
+            torch.nn.Softmax(dim=1)
+        )
+        segnet.requires_grad_(True)
+        segnet_params = segnet.parameters()
+
     for _up, _down in extract_lora_ups_down(unet):
-        print("Before training: Unet First Layer lora up", _up.weight.data)
-        print("Before training: Unet First Layer lora down", _down.weight.data)
+        # print("Before training: Unet First Layer lora up", _up.weight.data)
+        # print("Before training: Unet First Layer lora down", _down.weight.data)
         break
 
     vae.requires_grad_(False)
@@ -757,6 +789,20 @@ def main(args):
         if args.train_text_encoder
         else itertools.chain(*unet_lora_params)
     )
+
+    if args.train_unet_segmentation:
+        params_to_optimize = (
+            [
+                {"params": itertools.chain(*unet_lora_params), "lr": args.learning_rate},
+                {
+                    "params": itertools.chain(*text_encoder_lora_params),
+                    "lr": text_lr,
+                },
+            ]
+            if args.train_text_encoder
+            else itertools.chain(segnet_params, *unet_lora_params)
+        )
+
     optimizer = optimizer_class(
         params_to_optimize,
         lr=args.learning_rate,
@@ -769,21 +815,37 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_prompt=args.class_prompt,
-        tokenizer=tokenizer,
-        size=args.resolution,
-        center_crop=args.center_crop,
-        color_jitter=args.color_jitter,
-        resize=args.resize,
-    )
+    if not args.instance_segmap_data_root:
+        train_dataset = DreamBoothDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            color_jitter=args.color_jitter,
+            resize=args.resize,
+        )
+    else:
+        train_dataset = SegMapDataset(
+            instance_data_root=args.instance_data_dir,
+            instance_segmap_data_root=args.instance_segmap_data_root,
+            instance_prompt=args.instance_prompt,
+            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+            class_prompt=args.class_prompt,
+            tokenizer=tokenizer,
+            size=args.resolution,
+            center_crop=args.center_crop,
+            color_jitter=args.color_jitter,
+        )
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
+
+        if args.instance_segmap_data_root:
+            seg_map_pixel_values = [example["instance_segmap_images"] for example in examples]
 
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
@@ -794,6 +856,10 @@ def main(args):
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
+        if args.instance_segmap_data_root:
+            seg_map_pixel_values = torch.stack(seg_map_pixel_values)
+            seg_map_pixel_values = seg_map_pixel_values.to(memory_format=torch.contiguous_format).float()
+
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
             padding="max_length",
@@ -801,10 +867,18 @@ def main(args):
             return_tensors="pt",
         ).input_ids
 
-        batch = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-        }
+        if args.instance_segmap_data_root:
+            batch = {
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+                "segmap_pixel_values" : seg_map_pixel_values,
+            }
+        else:
+            batch = {
+                "input_ids": input_ids,
+                "pixel_values": pixel_values,
+            }
+
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -841,9 +915,13 @@ def main(args):
         ) = accelerator.prepare(
             unet, text_encoder, optimizer, train_dataloader, lr_scheduler
         )
-    else:
+    elif not args.train_unet_segmentation:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        unet, segnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, segnet, optimizer, train_dataloader, lr_scheduler
         )
 
     weight_dtype = torch.float32
@@ -880,6 +958,11 @@ def main(args):
         * args.gradient_accumulation_steps
     )
 
+    run_name = "./runs/"
+    if args.run_name:
+        run_name = "./runs/" + args.run_name
+    writer = SummaryWriter(log_dir=run_name)
+
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
     print(f"  Num batches each epoch = {len(train_dataloader)}")
@@ -899,7 +982,8 @@ def main(args):
     last_save = 0
 
     for epoch in range(args.num_train_epochs):
-        unet.train()
+        if not args.train_unet_segmentation:
+            unet.train()
         if args.train_text_encoder:
             text_encoder.train()
 
@@ -909,6 +993,14 @@ def main(args):
                 batch["pixel_values"].to(dtype=weight_dtype)
             ).latent_dist.sample()
             latents = latents * 0.18215
+            print(f'\n\nlatents shape:{latents.shape}\n\n')
+
+            if args.instance_segmap_data_root:
+                segmap = batch["segmap_pixel_values"].to(dtype=weight_dtype)
+                segmap_latents = vae.encode(
+                    batch["segmap_pixel_values"].to(dtype=weight_dtype)
+                    ).latent_dist.sample()
+                segmap_latents = segmap_latents * 0.18215 # TODO why this number?
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -928,9 +1020,13 @@ def main(args):
 
             # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
+            print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
             # Predict the noise residual
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            if not args.train_unet_segmentation:
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # this is the noise prediction
+            else:
+                unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                model_pred = unet_pred[:,:n_noise_pred_channels, :, :]
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -962,7 +1058,25 @@ def main(args):
                 # Add the prior loss to the instance loss.
                 loss = loss + args.prior_loss_weight * prior_loss
             else:
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                if args.train_unet_segmentation:
+                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :]
+
+                    # flatten output to pass through FC and softmax layer and restore its shape it can be passed to decoder
+                    seg_pred_shape = seg_pred.shape
+                    print(f'seg pred shape b4 linear:{seg_pred_shape}')
+                    flat_seg_pred = seg_pred.view(1,-1)
+                    print(f'noise_shape:{model_pred.shape} seg_shape:{seg_pred_shape} flat_seg_pred:{flat_seg_pred.shape}')
+                    #seg_pred = unet.seg(flat_seg_pred).view(1, 4, 64, 64) # TODO make more generic
+                    seg_pred = segnet(flat_seg_pred)
+                    print(f'seg_pred after linear:{seg_pred}')
+                    seg_pred = seg_pred.view(seg_pred.shape)
+                    
+                    seg_pred = vae.decode(seg_pred) # decode latents to segmentation img
+                    seg_loss = torch.nn.CrossEntropyLoss(seg_pred.float(), segmap.float())
+                    loss = seg_loss
+                else:
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
             accelerator.backward(loss)
             if accelerator.sync_gradients:
@@ -978,6 +1092,17 @@ def main(args):
             optimizer.zero_grad()
 
             global_step += 1
+
+            if global_step % 100 == 0:
+                if args.train_unet_segmentation:
+                    writer.add_scalar(tag='segmentation loss',
+                        scalar_value=seg_loss,
+                        global_step=global_step)
+
+                else:
+                    writer.add_scalar(tag='noise loss',
+                        scalar_value=loss,
+                        global_step=global_step)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1065,6 +1190,7 @@ def main(args):
         )
 
         print("\n\nLora TRAINING DONE!\n\n")
+        writer.close()
 
         if args.output_format == "pt" or args.output_format == "both":
             save_lora_weight(pipeline.unet, args.output_dir + "/lora_weight.pt")
@@ -1090,9 +1216,15 @@ def main(args):
                 auto_lfs_prune=True,
             )
 
+        if args.train_unet_segmentation:
+            torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
+                        'segmentation_head' : segnet.state_dict()}
+                        ,os.path.join(args.output_dir + "/unet_seg_weights.pt"))
+
     accelerator.end_training()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    torch.cuda.empty_cache()
     main(args)
