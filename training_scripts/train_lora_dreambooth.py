@@ -57,6 +57,16 @@ import re
 from torch.utils.tensorboard import SummaryWriter
 import functools
 import operator
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+def save_img(img, path):
+    img = img.cpu()
+    np_img = img.detach().numpy().squeeze()
+    np_img = np.transpose(np_img, (1,2,0))
+    pil_img = Image.fromarray(np.uint8(np_img*255))
+    pil_img.save(path)
             
 class DreamBoothDataset(Dataset):
     """
@@ -166,6 +176,9 @@ class SegMapDataset(DreamBoothDataset):
         size=512,
         center_crop=False,
         color_jitter=False,
+        h_flip=False,
+        segmap_normalize=False,
+        resize=False,
     ):
         super().__init__(instance_data_root,
                         instance_prompt,
@@ -174,10 +187,28 @@ class SegMapDataset(DreamBoothDataset):
                         class_prompt,
                         size,
                         center_crop,
-                        color_jitter)
+                        color_jitter,
+                        resize=args.resize)
 
         self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
         self.instance_segmap_data_root = instance_segmap_data_root
+        
+        segmap_transforms = []
+
+        if resize:
+            segmap_transforms.append(
+                transforms.Resize(
+                    size, interpolation=transforms.InterpolationMode.NEAREST
+                )
+            )
+        if center_crop:
+            segmap_transforms.append(transforms.CenterCrop(size))
+        if h_flip:
+            segmap_transforms.append(transforms.RandomHorizontalFlip())
+            
+        self.segmap_transforms = transforms.Compose(
+            [*segmap_transforms, transforms.ToTensor()]
+        )
 
     def __getitem__(self, index):
         example = {}
@@ -189,16 +220,18 @@ class SegMapDataset(DreamBoothDataset):
         )
         ## Segmap
         img_name, _ = os.path.splitext(img_name)
-        segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.jpg')
+        segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.png')
         segmap_instance_image = Image.open(segmap_img_path)
         
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
+            
+        if not segmap_instance_image.mode == "RGB":
+            pass
             segmap_instance_image = segmap_instance_image.convert("RGB")    
 
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_segmap_images"] = self.image_transforms(segmap_instance_image)
-
+        example["instance_segmap_images"] = self.segmap_transforms(segmap_instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
             self.instance_prompt,
             padding="do_not_pad",
@@ -588,12 +621,16 @@ def parse_args(input_args=None):
 
 
 def main(args):
+    main_device = 'cuda:4'
+    unet_device = 'cuda:3'
+
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with="tensorboard",
         logging_dir=logging_dir,
+        device_placement=False
     )
     # Currently, it's not possible to do gradient accumulation when training two models with accelerate.accumulate
     # This will be enabled soon in accelerate. For now, we don't allow gradient accumulation when training two models.
@@ -707,14 +744,14 @@ def main(args):
         new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
         unet.conv_out = new_layer
-        unet.conv_out.weight.data.requires_grad_(False)
-        unet.conv_out.weight.data[-tmp.out_channels:, :, :, :].requires_grad_(True)
-
+        # unet.conv_out.weight.data.requires_grad_(False)
+        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
         segnet = torch.nn.Sequential(
             torch.nn.Linear(n_features, n_features),
-            torch.nn.Softmax(dim=1)
+            #torch.nn.Softmax(dim=1)
         )
         segnet.requires_grad_(True)
         segnet_params = segnet.parameters()
@@ -800,7 +837,7 @@ def main(args):
                 },
             ]
             if args.train_text_encoder
-            else itertools.chain(segnet_params, *unet_lora_params)
+            else itertools.chain(segnet_params, unet.conv_out.parameters(), *unet_lora_params)
         )
 
     optimizer = optimizer_class(
@@ -838,6 +875,7 @@ def main(args):
             size=args.resolution,
             center_crop=args.center_crop,
             color_jitter=args.color_jitter,
+            resize=True,
         )
 
     def collate_fn(examples):
@@ -920,10 +958,16 @@ def main(args):
             unet, optimizer, train_dataloader, lr_scheduler
         )
     else:
-        unet, segnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, segnet, optimizer, train_dataloader, lr_scheduler
+        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet, optimizer, train_dataloader, lr_scheduler,
         )
-
+    # put all on correct device
+    # segnet.to(main_device)
+    unet.to(unet_device)
+    #optimizer.to(main_device)
+    #train_dataloader.to(main_device)
+    #lr_scheduler.to(main_device)
+    print(f'unet device:{unet.device}')
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -933,9 +977,13 @@ def main(args):
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
-    vae.to(accelerator.device, dtype=weight_dtype)
+    #vae.to(accelerator.device, dtype=weight_dtype)
+    vae.to(main_device, dtype=weight_dtype)
+    segnet.to(main_device, dtype=weight_dtype)
+    
     if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
+        #text_encoder.to(accelerator.device, dtype=weight_dtype)
+        text_encoder.to(main_device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -958,9 +1006,9 @@ def main(args):
         * args.gradient_accumulation_steps
     )
 
-    run_name = "./runs/"
+    run_name = args.output_dir
     if args.run_name:
-        run_name = "./runs/" + args.run_name
+        run_name = os.path.join(run_name, args.run_name)
     writer = SummaryWriter(log_dir=run_name)
 
     print("***** Running training *****")
@@ -990,16 +1038,16 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             # Convert images to latent space
             latents = vae.encode(
-                batch["pixel_values"].to(dtype=weight_dtype)
+                batch["pixel_values"].to(main_device, dtype=weight_dtype)
             ).latent_dist.sample()
             latents = latents * 0.18215
-            print(f'\n\nlatents shape:{latents.shape}\n\n')
+            # print(f'\n\nlatents shape:{latents.shape}\n\n')
 
             if args.instance_segmap_data_root:
-                segmap = batch["segmap_pixel_values"].to(dtype=weight_dtype)
+                segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
                 segmap_latents = vae.encode(
-                    batch["segmap_pixel_values"].to(dtype=weight_dtype)
-                    ).latent_dist.sample()
+                    segmap
+                    ).latent_dist.sample().to(main_device)
                 segmap_latents = segmap_latents * 0.18215 # TODO why this number?
 
             # Sample noise that we'll add to the latents
@@ -1019,13 +1067,17 @@ def main(args):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-            print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
+            encoder_hidden_states = text_encoder(batch["input_ids"].to(main_device))[0]
+            # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
             # Predict the noise residual
             if not args.train_unet_segmentation:
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # this is the noise prediction
+            # Predict segmentation map
             else:
-                unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                noisy_latents = noisy_latents.to(unet_device)
+                timesteps = timesteps.to(unet_device)
+                encoder_hidden_states = encoder_hidden_states.to(unet_device)
+                unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample.to(main_device)
                 model_pred = unet_pred[:,:n_noise_pred_channels, :, :]
 
             # Get the target for loss depending on the prediction type
@@ -1060,21 +1112,33 @@ def main(args):
             else:
                 if args.train_unet_segmentation:
                     model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
-                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :]
-
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device)
+                    seg_pred = seg_pred.to(dtype=torch.half)
+                    vae.to(main_device)
+                    #seg_pred = vae.decode(seg_pred).sample.to(main_device)
+                    # Convert predicted segmap to logits
+                    #seg_pred = torch.softmax(seg_pred, dim=1)
+                    # Display predicted segmap
+                    if (global_step + 1)% 1001 == 0:
+                        save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
+                        save_img(segmap, os.path.join(run_name, f'gt_{global_step}.png'))
                     # flatten output to pass through FC and softmax layer and restore its shape it can be passed to decoder
                     seg_pred_shape = seg_pred.shape
-                    print(f'seg pred shape b4 linear:{seg_pred_shape}')
+                    # print(f'seg pred shape b4 linear:{seg_pred_shape}')
                     flat_seg_pred = seg_pred.view(1,-1)
-                    print(f'noise_shape:{model_pred.shape} seg_shape:{seg_pred_shape} flat_seg_pred:{flat_seg_pred.shape}')
-                    #seg_pred = unet.seg(flat_seg_pred).view(1, 4, 64, 64) # TODO make more generic
+                    # print(f'noise_shape:{model_pred.shape} seg_shape:{seg_pred_shape} flat_seg_pred:{flat_seg_pred.shape}')
+                    # seg_pred = segnet(flat_seg_pred).view(1, 4, 64, 64) # TODO make more generic
                     seg_pred = segnet(flat_seg_pred)
                     print(f'seg_pred after linear:{seg_pred}')
-                    seg_pred = seg_pred.view(seg_pred.shape)
+                    seg_pred = seg_pred.view(seg_pred_shape)
+                    seg_pred = vae.decode(seg_pred).sample.to(main_device) # decode latents to segmentation img
+                    seg_pred = torch.softmax(seg_pred, dim=1)
+                    #print(f'pixel values:{torch.unique(segmap)}')
+                    vae.to(accelerator.device)
                     
-                    seg_pred = vae.decode(seg_pred) # decode latents to segmentation img
-                    seg_loss = torch.nn.CrossEntropyLoss(seg_pred.float(), segmap.float())
-                    loss = seg_loss
+                    seg_loss = torch.nn.CrossEntropyLoss()
+                    seg_loss = seg_loss(seg_pred.float(), segmap.float())
+                    loss = seg_loss.to(main_device)
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -1085,14 +1149,14 @@ def main(args):
                     if args.train_text_encoder
                     else unet.parameters()
                 )
-                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                #accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             progress_bar.update(1)
             optimizer.zero_grad()
 
             global_step += 1
-
+            
             if global_step % 100 == 0:
                 if args.train_unet_segmentation:
                     writer.add_scalar(tag='segmentation loss',
@@ -1219,7 +1283,7 @@ def main(args):
         if args.train_unet_segmentation:
             torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
                         'segmentation_head' : segnet.state_dict()}
-                        ,os.path.join(args.output_dir + "/unet_seg_weights.pt"))
+                        ,os.path.join(args.output_dir,"unet_seg_weights.pt"))
 
     accelerator.end_training()
 
