@@ -837,7 +837,7 @@ def main(args):
                 },
             ]
             if args.train_text_encoder
-            else itertools.chain(segnet_params, unet.conv_out.parameters(), *unet_lora_params)
+            else itertools.chain(unet.conv_out.parameters(), *unet_lora_params)
         )
 
     optimizer = optimizer_class(
@@ -962,11 +962,7 @@ def main(args):
             unet, optimizer, train_dataloader, lr_scheduler,
         )
     # put all on correct device
-    # segnet.to(main_device)
     unet.to(unet_device)
-    #optimizer.to(main_device)
-    #train_dataloader.to(main_device)
-    #lr_scheduler.to(main_device)
     print(f'unet device:{unet.device}')
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -1115,30 +1111,32 @@ def main(args):
                     seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device)
                     seg_pred = seg_pred.to(dtype=torch.half)
                     vae.to(main_device)
-                    #seg_pred = vae.decode(seg_pred).sample.to(main_device)
+                    seg_pred = vae.decode(seg_pred).sample.to(main_device)
                     # Convert predicted segmap to logits
-                    #seg_pred = torch.softmax(seg_pred, dim=1)
+                    # seg_pred = torch.softmax(seg_pred, dim=1)
                     # Display predicted segmap
                     if (global_step + 1)% 1001 == 0:
                         save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
                         save_img(segmap, os.path.join(run_name, f'gt_{global_step}.png'))
                     # flatten output to pass through FC and softmax layer and restore its shape it can be passed to decoder
-                    seg_pred_shape = seg_pred.shape
+                    # seg_pred_shape = seg_pred.shape
                     # print(f'seg pred shape b4 linear:{seg_pred_shape}')
-                    flat_seg_pred = seg_pred.view(1,-1)
+                    # flat_seg_pred = seg_pred.view(1,-1)
                     # print(f'noise_shape:{model_pred.shape} seg_shape:{seg_pred_shape} flat_seg_pred:{flat_seg_pred.shape}')
                     # seg_pred = segnet(flat_seg_pred).view(1, 4, 64, 64) # TODO make more generic
-                    seg_pred = segnet(flat_seg_pred)
-                    print(f'seg_pred after linear:{seg_pred}')
-                    seg_pred = seg_pred.view(seg_pred_shape)
-                    seg_pred = vae.decode(seg_pred).sample.to(main_device) # decode latents to segmentation img
-                    seg_pred = torch.softmax(seg_pred, dim=1)
+                    # seg_pred = segnet(flat_seg_pred)
+                    # print(f'seg_pred after linear:{seg_pred}')
+                    # seg_pred = seg_pred.view(seg_pred_shape)
+                    # seg_pred = vae.decode(seg_pred).sample.to(main_device) # decode latents to segmentation img
+                    # seg_pred = torch.softmax(seg_pred, dim=1)
                     #print(f'pixel values:{torch.unique(segmap)}')
                     vae.to(accelerator.device)
                     
                     seg_loss = torch.nn.CrossEntropyLoss()
                     seg_loss = seg_loss(seg_pred.float(), segmap.float())
                     loss = seg_loss.to(main_device)
+                    
+                    
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
