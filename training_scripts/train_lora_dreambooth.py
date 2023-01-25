@@ -61,6 +61,8 @@ import operator
 import matplotlib.pyplot as plt
 import numpy as np
 
+import xml.etree.ElementTree as ET
+
 def save_img(img, path):
     img = img.cpu()
     np_img = img.detach().numpy().squeeze()
@@ -169,6 +171,7 @@ class SegMapDataset(DreamBoothDataset):
     def __init__(self,
         instance_data_root,
         instance_segmap_data_root,
+        annotations_root,
         instance_prompt,
         tokenizer,
         class_data_root=None,
@@ -191,7 +194,17 @@ class SegMapDataset(DreamBoothDataset):
                         resize=args.resize)
 
         self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
+        # sanity check
+        if (len(self.instance_segmap_images_path) != self.num_instance_images):
+            raise Exception("number of segmaps is different from number of images!")
+
         self.instance_segmap_data_root = instance_segmap_data_root
+        self.annotations_root = annotations_root
+        self.class_annotations = self.__get_class_annotations__()
+
+        # sanity check
+        if (len(self.class_annotations) != self.num_instance_images):
+            raise Exception("number of class annotation is differnet from number of images!")
         
         segmap_transforms = []
 
@@ -209,6 +222,45 @@ class SegMapDataset(DreamBoothDataset):
         self.segmap_transforms = transforms.Compose(
             [*segmap_transforms, transforms.ToTensor()]
         )
+    
+    def __get_class_annotations__(self):
+        voc_classes = {'background' : 'background',
+                    'aeroplane' : 'aeroplane',
+                    'bicycle' : 'bicycle',
+                    'bird' : 'bird',
+                    'boat' : 'boat',
+                    'bottle' : 'bottle',
+                    'bus' : 'bus',
+                    'car' : 'car',
+                    'cat' : 'cat',
+                    'chair' : 'chair',
+                    'cow' : 'cow',
+                    'diningtable' : 'dining table',
+                    'dog' : 'dog',
+                    'horse' : 'horse',
+                    'motorbike' : 'motorbike',
+                    'person' : 'person',
+                    'pottedplant' : 'potted plant',
+                    'sheep' : 'sheep',
+                    'sofa' : 'sofa',
+                    'train' : 'train',
+                    'tvmonitor' : 'tv monitor'}
+
+        images_names = [os.path.splitext(os.path.basename(path))[0] for path in self.instance_segmap_images_path]
+        xmls_paths = [os.path.join(self.annotations_root, img_name +'.xml') for img_name in images_names]
+    
+        annotations = []
+        for path in xmls_paths:
+            # create element tree object
+            tree = ET.parse(path)
+            # get root element
+            root = tree.getroot()
+            # iterate news items
+            annontation = root.find('object/name')
+
+            annotations += [self.instance_prompt + " " + voc_classes[annontation.text]]
+
+        return annotations
 
     def __getitem__(self, index):
         example = {}
@@ -220,6 +272,7 @@ class SegMapDataset(DreamBoothDataset):
         )
         ## Segmap
         img_name, _ = os.path.splitext(img_name)
+
         segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.png')
         segmap_instance_image = Image.open(segmap_img_path)
         
@@ -232,8 +285,9 @@ class SegMapDataset(DreamBoothDataset):
 
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_segmap_images"] = self.segmap_transforms(segmap_instance_image)
+        example["instance_classes"] = self.class_annotations[index % self.num_instance_images]
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+            self.class_annotations[index % self.num_instance_images],
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -322,6 +376,13 @@ def parse_args(input_args=None):
         default=None,
         required=False,
         help="A folder containing the training data of segmentation maps for instance images.",   
+    )
+    parser.add_argument(
+        "--annotations_folder",
+        type=str,
+        default="../data/Annotations/",
+        required=False,
+        help="A folder containing annotations for segmentation maps",
     )
     parser.add_argument(
         "--train_unet_segmentation",
@@ -621,8 +682,8 @@ def parse_args(input_args=None):
 
 
 def main(args):
-    main_device = 'cuda:4'
-    unet_device = 'cuda:3'
+    main_device = 'cuda:0'
+    unet_device = 'cuda:2'
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -868,6 +929,7 @@ def main(args):
         train_dataset = SegMapDataset(
             instance_data_root=args.instance_data_dir,
             instance_segmap_data_root=args.instance_segmap_data_root,
+            annotations_root = args.annotations_folder,
             instance_prompt=args.instance_prompt,
             class_data_root=args.class_data_dir if args.with_prior_preservation else None,
             class_prompt=args.class_prompt,
