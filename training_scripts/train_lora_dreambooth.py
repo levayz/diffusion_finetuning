@@ -744,8 +744,8 @@ def main(args):
         new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
         unet.conv_out = new_layer
-        # unet.conv_out.weight.data.requires_grad_(False)
-        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        unet.conv_out.weight.data.requires_grad_(False)
+        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
         unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
@@ -975,7 +975,7 @@ def main(args):
     # as these models are only used for inference, keeping weights in full precision is not required.
     #vae.to(accelerator.device, dtype=weight_dtype)
     vae.to(main_device, dtype=weight_dtype)
-    segnet.to(main_device, dtype=weight_dtype)
+    # segnet.to(main_device, dtype=weight_dtype)
     
     if not args.train_text_encoder:
         #text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -1108,16 +1108,20 @@ def main(args):
             else:
                 if args.train_unet_segmentation:
                     model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
-                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device)
-                    seg_pred = seg_pred.to(dtype=torch.half)
-                    vae.to(main_device)
-                    seg_pred = vae.decode(seg_pred).sample.to(main_device)
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
+                    mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
+                    loss = mse_loss.to(main_device)
+
                     # Convert predicted segmap to logits
                     # seg_pred = torch.softmax(seg_pred, dim=1)
                     # Display predicted segmap
-                    if (global_step + 1)% 1001 == 0:
+                    if (global_step + 1) % (args.max_train_steps // 10) == 0:
+                        vae.to(main_device)
+                        seg_pred = vae.decode(seg_pred).sample.to(main_device)
+                        latents = latents.to(main_device)
+                        map = vae.decode(latents).sample.to(main_device)
                         save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
-                        save_img(segmap, os.path.join(run_name, f'gt_{global_step}.png'))
+                        save_img(map, os.path.join(run_name, f'gt_decoded{global_step}.png'))
                     # flatten output to pass through FC and softmax layer and restore its shape it can be passed to decoder
                     # seg_pred_shape = seg_pred.shape
                     # print(f'seg pred shape b4 linear:{seg_pred_shape}')
@@ -1129,13 +1133,10 @@ def main(args):
                     # seg_pred = seg_pred.view(seg_pred_shape)
                     # seg_pred = vae.decode(seg_pred).sample.to(main_device) # decode latents to segmentation img
                     # seg_pred = torch.softmax(seg_pred, dim=1)
-                    #print(f'pixel values:{torch.unique(segmap)}')
-                    vae.to(accelerator.device)
-                    
-                    seg_loss = torch.nn.CrossEntropyLoss()
-                    seg_loss = seg_loss(seg_pred.float(), segmap.float())
-                    loss = seg_loss.to(main_device)
-                    
+                    #print(f'pixel values:{torch.unique(segmap)}')                    
+                    # seg_loss = torch.nn.CrossEntropyLoss()
+                    # seg_loss = seg_loss(seg_pred.float(), segmap.float())
+                    # loss = seg_loss.to(main_device)                    
                     
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1147,7 +1148,7 @@ def main(args):
                     if args.train_text_encoder
                     else unet.parameters()
                 )
-                #accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
             optimizer.step()
             lr_scheduler.step()
             progress_bar.update(1)
@@ -1158,7 +1159,7 @@ def main(args):
             if global_step % 100 == 0:
                 if args.train_unet_segmentation:
                     writer.add_scalar(tag='segmentation loss',
-                        scalar_value=seg_loss,
+                        scalar_value=mse_loss,
                         global_step=global_step)
 
                 else:
