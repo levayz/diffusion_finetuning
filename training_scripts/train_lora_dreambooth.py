@@ -25,7 +25,7 @@ from diffusers import (
     #UNet2DConditionModel,
 )
 import sys
-sys.path.append('/home/Lev/Projects/diffusion_finetuning/') # Need this to import files from the diffusers folder
+sys.path.append('/disk4/Lev/Projects/diffusion_finetuning/') # Need this to import files from the diffusers folder
 print(sys.path)
 
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
@@ -62,6 +62,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 import xml.etree.ElementTree as ET
+import wandb
 
 def save_img(img, path):
     img = img.cpu()
@@ -193,7 +194,8 @@ class SegMapDataset(DreamBoothDataset):
                         color_jitter,
                         resize=args.resize)
 
-        self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
+        # self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
+        self.instance_segmap_images_path = [os.path.join(instance_segmap_data_root, os.path.splitext(os.path.basename(path))[0] + '.png') for path in self.instance_images_path]
         # sanity check
         if (len(self.instance_segmap_images_path) != self.num_instance_images):
             raise Exception("number of segmaps is different from number of images!")
@@ -251,11 +253,8 @@ class SegMapDataset(DreamBoothDataset):
     
         annotations = []
         for path in xmls_paths:
-            # create element tree object
             tree = ET.parse(path)
-            # get root element
             root = tree.getroot()
-            # iterate news items
             annontation = root.find('object/name')
 
             annotations += [self.instance_prompt + " " + voc_classes[annontation.text]]
@@ -272,8 +271,8 @@ class SegMapDataset(DreamBoothDataset):
         )
         ## Segmap
         img_name, _ = os.path.splitext(img_name)
-
-        segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.png')
+        # segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.png')
+        segmap_img_path = self.instance_segmap_images_path[index % self.num_instance_images]
         segmap_instance_image = Image.open(segmap_img_path)
         
         if not instance_image.mode == "RGB":
@@ -292,6 +291,8 @@ class SegMapDataset(DreamBoothDataset):
             truncation=True,
             max_length=self.tokenizer.model_max_length,
         ).input_ids
+        
+        # print(f'mask:{segmap_img_path}, annotation:{self.class_annotations[index % self.num_instance_images]}')
 
         if self.class_data_root:
             class_image = Image.open(
@@ -397,6 +398,13 @@ def parse_args(input_args=None):
         default=None,
         required=False,
         help="run name for TesnorBoard",
+    )
+    parser.add_argument(
+        "--description",
+        type=str,
+        default="",
+        required=False,
+        help="description of current run"
     )
     parser.add_argument(
         "--class_data_dir",
@@ -682,8 +690,10 @@ def parse_args(input_args=None):
 
 
 def main(args):
-    main_device = 'cuda:0'
-    unet_device = 'cuda:2'
+    main_device = 'cuda:4'
+    unet_device = 'cuda:5'
+    text_enc_device = 'cuda:4'
+    # text_enc_device = 
 
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
@@ -805,8 +815,8 @@ def main(args):
         new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
         unet.conv_out = new_layer
-        unet.conv_out.weight.data.requires_grad_(False)
-        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        # unet.conv_out.weight.data.requires_grad_(False)
+        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
         unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
@@ -1019,7 +1029,7 @@ def main(args):
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
         )
-    else:
+    else: # TODO this could probably be deleted
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler,
         )
@@ -1027,10 +1037,10 @@ def main(args):
     unet.to(unet_device)
     print(f'unet device:{unet.device}')
     weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
+    # if accelerator.mixed_precision == "fp16":
+    #     weight_dtype = torch.float16
+    # elif accelerator.mixed_precision == "bf16":
+    #     weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -1041,7 +1051,9 @@ def main(args):
     
     if not args.train_text_encoder:
         #text_encoder.to(accelerator.device, dtype=weight_dtype)
-        text_encoder.to(main_device)
+        text_encoder.to(main_device, dtype=weight_dtype)
+    else:
+        text_encoder.to(text_enc_device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -1064,10 +1076,21 @@ def main(args):
         * args.gradient_accumulation_steps
     )
 
-    run_name = args.output_dir
+    # run_name = args.output_dir
     if args.run_name:
-        run_name = os.path.join(run_name, args.run_name)
-    writer = SummaryWriter(log_dir=run_name)
+        args.output_dir = os.path.join(args.output_dir, args.run_name)
+        # run_name = os.path.join(run_name, args.run_name)
+    writer = SummaryWriter(log_dir=args.output_dir)
+    
+    wandb_config = {
+        'lr' : args.learning_rate,
+        'training_steps:' : args.max_train_steps,
+        'text_encoder' : True if args.train_text_encoder else False,
+        'text_enc_lr' : text_lr if args.train_text_encoder else None,
+        'segmaps:' : args.instance_segmap_data_root if args.instance_segmap_data_root else None,
+        'description': args.description,
+    }
+    wandb.init(config=wandb_config, project='diffusion_segmentation', name=args.run_name) 
 
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
@@ -1086,6 +1109,7 @@ def main(args):
     progress_bar.set_description("Steps")
     global_step = 0
     last_save = 0
+    min_loss = None
 
     for epoch in range(args.num_train_epochs):
         if not args.train_unet_segmentation:
@@ -1125,7 +1149,7 @@ def main(args):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["input_ids"].to(main_device))[0]
+            encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device)
             # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
             # Predict the noise residual
             if not args.train_unet_segmentation:
@@ -1173,11 +1197,13 @@ def main(args):
                     seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
                     mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
                     loss = mse_loss.to(main_device)
-
+                    if min_loss is None or loss < min_loss:
+                        min_loss = loss
+                    wandb.log({'seg_loss' : loss})
                     # Convert predicted segmap to logits
                     # seg_pred = torch.softmax(seg_pred, dim=1)
                     # Display predicted segmap
-                    if (global_step + 1) % (args.max_train_steps // 10) == 0:
+                    if False and (global_step + 1) % (args.max_train_steps // 10) == 0:
                         vae.to(main_device)
                         seg_pred = vae.decode(seg_pred).sample.to(main_device)
                         latents = latents.to(main_device)
@@ -1268,6 +1294,12 @@ def main(args):
                                 filename_text_encoder,
                                 target_replace_module=["CLIPAttention"],
                             )
+                            
+                        if args.train_unet_segmentation and loss <= min_loss:
+                            torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
+                                        'segmentation_head' : segnet.state_dict()}
+                                        ,os.path.join(args.output_dir, f"unet_seg_weights_min_loss.pt"))
+
 
                         for _up, _down in extract_lora_ups_down(pipeline.unet):
                             print(
