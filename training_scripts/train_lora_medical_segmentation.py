@@ -721,21 +721,21 @@ def main(args):
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
-        pixel_values = [[item for item in example["instance_images"]] for example in examples]
-        img = pixel_values[0][0]
+        pixel_values = [example["instance_image"] for example in examples]
+        img = pixel_values[0]
         save_tensor_as_img(img, './img.jpeg', normalized=True)
         if args.instance_segmap_data_root:
-            seg_map_pixel_values = [[item for item in example["instance_segmap_images"]] for example in examples]
-            save_tensor_as_img(seg_map_pixel_values[0][0], './segmap_img.jpeg')
+            seg_map_pixel_values = [example["instance_segmap_image"] for example in examples]
+            save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg')
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         
-        pixel_values = [torch.stack(item).to(memory_format=torch.contiguous_format).float() for item in pixel_values]
-        # pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
         if args.instance_segmap_data_root:
-            seg_map_pixel_values = [torch.stack(item).to(memory_format=torch.contiguous_format).float() for item in seg_map_pixel_values]
-            # seg_map_pixel_values = seg_map_pixel_values.to(memory_format=torch.contiguous_format).float()
+            seg_map_pixel_values = torch.stack(seg_map_pixel_values)
+            seg_map_pixel_values = seg_map_pixel_values.to(memory_format=torch.contiguous_format).float()
 
         input_ids = tokenizer.pad(
             {"input_ids": input_ids},
@@ -853,7 +853,7 @@ def main(args):
         'segmaps:' : args.instance_segmap_data_root if args.instance_segmap_data_root else None,
         'description': args.description,
     }
-    # wandb.init(config=wandb_config, project='diffusion_segmentation', name=args.run_name) 
+    wandb.init(config=wandb_config, project='diffusion_segmentation', name=args.run_name) 
 
     print("***** Running training *****")
     print(f"  Num examples = {len(train_dataset)}")
@@ -882,117 +882,115 @@ def main(args):
 
         for step, batch in enumerate(train_dataloader):
             # Convert images to latent space
-            for i in range(len(batch['pixel_values'])):
-                latents = vae.encode(
-                    batch["pixel_values"][i].to(main_device, dtype=weight_dtype)
-                ).latent_dist.sample()
-                latents = latents * 0.18215
+            latents = vae.encode(
+                batch["pixel_values"].to(main_device, dtype=weight_dtype)
+            ).latent_dist.sample()
+            latents = latents * 0.18215
 
-                if args.instance_segmap_data_root:
-                    # save_tensor_as_img(batch['segmap_pixel_values'][0], 'segmap_img.jpeg')
-                    segmap = batch["segmap_pixel_values"][i].to(main_device, dtype=weight_dtype)
-                    segmap_latents = vae.encode(
-                        segmap
-                        ).latent_dist.sample().to(main_device)
-                    segmap_latents = segmap_latents * 0.18215 # TODO why this number?
+            if args.instance_segmap_data_root:
+                segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
+                segmap_latents = vae.encode(
+                    segmap
+                    ).latent_dist.sample().to(main_device)
+                segmap_latents = segmap_latents * 0.18215 # TODO why this number?
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (bsz,),
-                    device=latents.device,
+            # Sample noise that we'll add to the latents
+            noise = torch.randn_like(latents)
+            bsz = latents.shape[0]
+            # Sample a random timestep for each image
+            timesteps = torch.randint(
+                0,
+                noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=latents.device,
+            )
+            timesteps = timesteps.long()
+
+            # Add noise to the latents according to the noise magnitude at each timestep
+            # (this is the forward diffusion process)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+            # Get the text embedding for conditioning
+            encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device)
+            # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
+            # Predict the noise residual
+            if not args.train_unet_segmentation:
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # this is the noise prediction
+            # Predict segmentation map
+            else:
+                noisy_latents = noisy_latents.to(unet_device)
+                timesteps = timesteps.to(unet_device)
+                encoder_hidden_states = encoder_hidden_states.to(unet_device)
+                unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample.to(main_device)
+                model_pred = unet_pred[:,:n_noise_pred_channels, :, :]
+
+            # Get the target for loss depending on the prediction type
+            if noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif noise_scheduler.config.prediction_type == "v_prediction":
+                target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                raise ValueError(
+                    f"Unknown prediction type {noise_scheduler.config.prediction_type}"
                 )
-                timesteps = timesteps.long()
 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            if args.with_prior_preservation:
+                # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+                model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                target, target_prior = torch.chunk(target, 2, dim=0)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device)
-                # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
-                # Predict the noise residual
-                if not args.train_unet_segmentation:
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # this is the noise prediction
-                # Predict segmentation map
+                # Compute instance loss
+                loss = (
+                    F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                    .mean([1, 2, 3])
+                    .mean()
+                )
+
+                # Compute prior loss
+                prior_loss = F.mse_loss(
+                    model_pred_prior.float(), target_prior.float(), reduction="mean"
+                )
+
+                # Add the prior loss to the instance loss.
+                loss = loss + args.prior_loss_weight * prior_loss
+            else:
+                if args.train_unet_segmentation:
+                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
+                    mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
+                    cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
+                    labels = torch.ones(1).to(main_device)
+                    loss = cosine_sim_loss(seg_pred.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
+                    # loss = mse_loss.to(main_device)
+                    if min_loss is None or loss < min_loss:
+                        min_loss = loss
+                    wandb.log({'seg_loss' : loss})
+                    # Convert predicted segmap to logits
+                    # seg_pred = torch.softmax(seg_pred, dim=1)
+                    # Display predicted segmap
+                    if False and (global_step + 1) % (args.max_train_steps // 10) == 0:
+                        vae.to(main_device)
+                        seg_pred = vae.decode(seg_pred).sample.to(main_device)
+                        latents = latents.to(main_device)
+                        map = vae.decode(latents).sample.to(main_device)
+                        save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
+                        save_img(map, os.path.join(run_name, f'gt_decoded{global_step}.png'))           
+                    
                 else:
-                    noisy_latents = noisy_latents.to(unet_device)
-                    timesteps = timesteps.to(unet_device)
-                    encoder_hidden_states = encoder_hidden_states.to(unet_device)
-                    unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample.to(main_device)
-                    model_pred = unet_pred[:,:n_noise_pred_channels, :, :]
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(
-                        f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                    )
-
-                if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                    target, target_prior = torch.chunk(target, 2, dim=0)
-
-                    # Compute instance loss
-                    loss = (
-                        F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                        .mean([1, 2, 3])
-                        .mean()
-                    )
-
-                    # Compute prior loss
-                    prior_loss = F.mse_loss(
-                        model_pred_prior.float(), target_prior.float(), reduction="mean"
-                    )
-
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
-                else:
-                    if args.train_unet_segmentation:
-                        model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
-                        seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
-                        mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
-                        cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
-                        labels = torch.ones(1).to(main_device)
-                        loss = cosine_sim_loss(seg_pred.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
-                        # loss = mse_loss.to(main_device)
-                        if min_loss is None or loss < min_loss:
-                            min_loss = loss
-                        wandb.log({'seg_loss' : loss})
-                        # Convert predicted segmap to logits
-                        # seg_pred = torch.softmax(seg_pred, dim=1)
-                        # Display predicted segmap
-                        if False and (global_step + 1) % (args.max_train_steps // 10) == 0:
-                            vae.to(main_device)
-                            seg_pred = vae.decode(seg_pred).sample.to(main_device)
-                            latents = latents.to(main_device)
-                            map = vae.decode(latents).sample.to(main_device)
-                            save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
-                            save_img(map, os.path.join(run_name, f'gt_decoded{global_step}.png'))           
-                        
-                    else:
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                progress_bar.update(1)
-                optimizer.zero_grad()
+            accelerator.backward(loss)
+            if accelerator.sync_gradients:
+                params_to_clip = (
+                    itertools.chain(unet.parameters(), text_encoder.parameters())
+                    if args.train_text_encoder
+                    else unet.parameters()
+                )
+                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+            optimizer.step()
+            lr_scheduler.step()
+            progress_bar.update(1)
+            optimizer.zero_grad()
 
             global_step += 1
             

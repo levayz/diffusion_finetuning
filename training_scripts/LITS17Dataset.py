@@ -14,6 +14,7 @@ import fnmatch
 from torchvision import transforms
 
 from PIL import Image
+import itertools
 
 class LITS17Dataset(dataset):
     def __init__(self,
@@ -35,13 +36,15 @@ class LITS17Dataset(dataset):
         self.resize = resize
 
         self.ct_list = self.__get_ct_file_names__(ct_dir)
-
         self.seg_list = list(map(lambda x: x.replace('volume', 'segmentation'), self.ct_list))
-
+        
         self.ct_list = list(map(lambda x: os.path.join(ct_dir, x), self.ct_list))
         self.seg_list = list(map(lambda x: os.path.join(seg_dir, x), self.seg_list))
 
-        self.__length = len(self.ct_list)
+        self.ct_list_w_slices = self.__create_list_with_slices__(self.ct_list, self.num_slices)
+        self.seg_list_w_slices = self.__create_list_with_slices__(self.seg_list, self.num_slices)
+
+        self.__length__ = len(self.ct_list_w_slices)
 
         img_transforms = []
         segmap_transforms = []
@@ -59,33 +62,31 @@ class LITS17Dataset(dataset):
             for filename in fnmatch.filter(filenames, '*volume*'):
                 ct_files.append(filename)
         return ct_files
+    
+    def __create_list_with_slices__(self, lst, n_slices):
+        """
+        create a list of tuples where the 1st item is path to ct
+        and the 2nd item is the deisred slice
+        """
+        list_w_slices = [[tuple([name, i]) for i in range(n_slices)] for name in lst]
+        merged_list = list(itertools.chain.from_iterable(list_w_slices))
+
+        return merged_list 
 
     def __getitem__(self, index):
         example = {}
 
-        ct_path = self.ct_list[index]
-        seg_path = self.seg_list[index]
-
-        ct = sitk.ReadImage(ct_path, sitk.sitkInt16)
+        ct_path, ct_slice = self.ct_list_w_slices[index]
+        seg_path, seg_slice = self.seg_list_w_slices[index]
+        
+        ct = sitk.ReadImage(ct_path, sitk.sitkUInt8)
         seg = sitk.ReadImage(seg_path, sitk.sitkUInt8)
 
-        ct_array = sitk.GetArrayFromImage(ct)
-        seg_array = sitk.GetArrayFromImage(seg)
+        ct_array = sitk.GetArrayFromImage(ct)[ct_slice]
+        seg_array = sitk.GetArrayFromImage(seg)[seg_slice]
 
-        ct_array = ct_array.astype(np.float32)
-        ct_array = ct_array
-
-        start_slice = random.randint(0, ct_array.shape[0] - self.num_slices)
-        end_slice = start_slice + self.num_slices - 1
-
-        ct_array = ct_array[start_slice:end_slice + 1, :, :]
-        seg_array = seg_array[start_slice:end_slice + 1, :, :]
-
-        ct_array = torch.FloatTensor(ct_array)
-        seg_array = torch.FloatTensor(seg_array)
-
-        ct_imgs = self.__convert_slices_to_images__(ct_array)
-        seg_imgs = self.__convert_slices_to_images__(seg_array)
+        ct_img = self.__convert_slice_to_img__(ct_array)
+        seg_img = self.__convert_slice_to_img__(seg_array)
 
         if self.tokenizer:
             example['instance_prompt_ids'] = self.tokenizer(
@@ -95,13 +96,24 @@ class LITS17Dataset(dataset):
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
 
-        example['instance_images'] = [self.image_transforms(ct_img) for ct_img in ct_imgs]
-        example['instance_segmap_images'] = [self.segmap_transforms(seg_img) for seg_img in seg_imgs]
+        example['instance_image'] = self.image_transforms(ct_img)
+        example['instance_segmap_image'] = self.segmap_transforms(seg_img)
 
         return example
 
     def __len__(self):
-        return self.__length
+        return self.__length__
+
+    def __convert_slice_to_img__(self, slice):
+        arr = slice
+        if len(arr.shape) > 3:
+            arr = arr.squeeze(0)
+        if arr.shape == 3:
+            arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
+
+        img = Image.fromarray(arr).convert('RGB')
+
+        return img
     
     def __convert_slices_to_images__(self, ct_arr):
         ct_imgs = []
@@ -111,6 +123,6 @@ class LITS17Dataset(dataset):
             arr = arr.squeeze(0)
 
         arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
-        imgs = [Image.fromarray(arr[:,:,indx]) for indx in range(n_slices)]
+        imgs = [Image.fromarray(arr[:,:,indx]).convert('RGB') for indx in range(n_slices)]
 
         return imgs
