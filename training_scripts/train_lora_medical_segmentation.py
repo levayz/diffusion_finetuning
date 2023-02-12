@@ -178,6 +178,20 @@ def parse_args(input_args=None):
         help="description of current run"
     )
     parser.add_argument(
+        "--seg_slices_pkl",
+        type=str,
+        default=None,
+        required=False,
+        help="path to pickle object contraining dictionary with paths and desired slices from ct segmentation maps"
+    )
+    parser.add_argument(
+        "--vol_slices_pkl",
+        type=str,
+        default=None,
+        required=False,
+        help="path to pickle object contraining dictionary with paths and desired slices from ct volume"
+    )
+    parser.add_argument(
         "--class_data_dir",
         type=str,
         default=None,
@@ -717,18 +731,18 @@ def main(args):
             size=args.resolution,
             center_crop=args.center_crop,
             resize=args.resize,
+            path_slices_for_segmap=args.seg_slices_pkl,
+            path_slices_for_vol=args.vol_slices_pkl,
         )
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_image"] for example in examples]
         img = pixel_values[0]
-        save_tensor_as_img(img, './img.jpeg', normalized=True)
+        # save_tensor_as_img(img, './img.jpeg', normalized=True)
         if args.instance_segmap_data_root:
             seg_map_pixel_values = [example["instance_segmap_image"] for example in examples]
-            save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg')
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
+            # save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg', normalized=True)
         
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()

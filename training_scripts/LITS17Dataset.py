@@ -15,6 +15,7 @@ from torchvision import transforms
 
 from PIL import Image
 import itertools
+import pickle
 
 class LITS17Dataset(dataset):
     def __init__(self,
@@ -26,6 +27,8 @@ class LITS17Dataset(dataset):
                  center_crop=False,
                  num_slices=48,
                  resize=True,
+                 path_slices_for_segmap=None,
+                 path_slices_for_vol=None,
                  ):
         
         self.size = size
@@ -35,14 +38,21 @@ class LITS17Dataset(dataset):
         self.num_slices = num_slices
         self.resize = resize
 
+        self.ct_dir = ct_dir
+        self.seg_dir = seg_dir
+
         self.ct_list = self.__get_ct_file_names__(ct_dir)
         self.seg_list = list(map(lambda x: x.replace('volume', 'segmentation'), self.ct_list))
         
         self.ct_list = list(map(lambda x: os.path.join(ct_dir, x), self.ct_list))
         self.seg_list = list(map(lambda x: os.path.join(seg_dir, x), self.seg_list))
 
-        self.ct_list_w_slices = self.__create_list_with_slices__(self.ct_list, self.num_slices)
-        self.seg_list_w_slices = self.__create_list_with_slices__(self.seg_list, self.num_slices)
+        if path_slices_for_segmap:
+            self.ct_list_w_slices = self.__create_list_w_slices_from_pickle__(path_slices_for_vol)
+            self.seg_list_w_slices = self.__create_list_w_slices_from_pickle__(path_slices_for_segmap)
+        else:
+            self.ct_list_w_slices = self.__create_list_with_slices__(self.ct_list, self.num_slices)
+            self.seg_list_w_slices = self.__create_list_with_slices__(self.seg_list, self.num_slices)
 
         self.__length__ = len(self.ct_list_w_slices)
 
@@ -63,6 +73,20 @@ class LITS17Dataset(dataset):
                 ct_files.append(filename)
         return ct_files
     
+    def __create_list_w_slices_from_pickle__(self, path):
+        """
+        Create a list where each item is a tuple
+        1st item in tuple is path to image and the 2nd is the desired slice.
+        This function relies on a pickle file containing desired slices for each image
+        @path - path to the pickle file
+        """
+        with open(path, 'rb') as handle:
+            loaded_dict = pickle.load(handle)
+        list_w_slices = [[tuple([key, item]) for item in slices] for key, slices in loaded_dict.items()]
+        merged_list_w_slices = list(itertools.chain.from_iterable(list_w_slices))
+
+        return merged_list_w_slices
+    
     def __create_list_with_slices__(self, lst, n_slices):
         """
         create a list of tuples where the 1st item is path to ct
@@ -78,6 +102,8 @@ class LITS17Dataset(dataset):
 
         ct_path, ct_slice = self.ct_list_w_slices[index]
         seg_path, seg_slice = self.seg_list_w_slices[index]
+        # print(f'ct path:{ct_path} slice:{ct_slice}')
+        # print(f'seg path:{seg_path} slice:{seg_slice}')
         
         ct = sitk.ReadImage(ct_path, sitk.sitkUInt8)
         seg = sitk.ReadImage(seg_path, sitk.sitkUInt8)
