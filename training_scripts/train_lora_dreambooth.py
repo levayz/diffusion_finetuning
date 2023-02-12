@@ -48,6 +48,7 @@ from lora_diffusion.xformers_utils import set_use_memory_efficient_attention_xfo
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.utils import save_image
 
 from pathlib import Path
 
@@ -64,13 +65,50 @@ import numpy as np
 import xml.etree.ElementTree as ET
 import wandb
 
+from data.get_voc_color_by_class import get_voc_colormap_png, color_map, get_color_map_by_class_rgb
+
 def save_img(img, path):
     img = img.cpu()
     np_img = img.detach().numpy().squeeze()
     np_img = np.transpose(np_img, (1,2,0))
-    pil_img = Image.fromarray(np.uint8(np_img*255))
+    pil_img = Image.fromarray(np.uint8(np_img))
     pil_img.save(path)
+
+def save_tensor_as_img(tensor, path, normalized=False):
+    if normalized:
+        arr = np.array(tensor*255, dtype=np.uint8)
+    else:
+        arr = np.array(tensor, dtype=np.uint8)
+    
+    arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
+    img = Image.fromarray(arr)
+    img.save(path)
             
+def numpy_to_pil(images):
+    """
+    Convert a numpy image or a batch of images to a PIL image.
+    """
+    if images.ndim == 3:
+        images = images[None, ...]
+    images = (images * 255).round().astype("uint8")
+    if images.shape[-1] == 1:
+        # special case for grayscale (single channel) images
+        pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+    else:
+        pil_images = [Image.fromarray(image) for image in images]
+
+    return pil_images
+
+def decode_latents(origin_latents, vae, path):
+    latents = origin_latents.clone().detach()
+    latents = 1 / 0.18215 * latents
+    latents = latents.to(dtype=torch.float32)
+    image = vae.decode(latents).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
+    image = image.cpu().permute(0, 2, 3, 1).float().numpy().squeeze(0)
+    numpy_to_pil(image)[0].save(path)
+
 class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
@@ -130,7 +168,8 @@ class DreamBoothDataset(Dataset):
             img_transforms.append(transforms.RandomHorizontalFlip())
 
         self.image_transforms = transforms.Compose(
-            [*img_transforms, transforms.ToTensor(), transforms.Normalize([0.5], [0.5])]
+            [*img_transforms, transforms.ToTensor(), transforms.Normalize([0.5], [0.5])
+            ]
         )
 
     def __len__(self):
@@ -181,7 +220,6 @@ class SegMapDataset(DreamBoothDataset):
         center_crop=False,
         color_jitter=False,
         h_flip=False,
-        segmap_normalize=False,
         resize=False,
     ):
         super().__init__(instance_data_root,
@@ -203,26 +241,46 @@ class SegMapDataset(DreamBoothDataset):
         self.instance_segmap_data_root = instance_segmap_data_root
         self.annotations_root = annotations_root
         self.class_annotations = self.__get_class_annotations__()
+        self.voc_png_colormap_dict = get_voc_colormap_png()
+        self.voc_rgb_colormap_dict = get_color_map_by_class_rgb()
+        self.voc_colormap = color_map()
 
         # sanity check
         if (len(self.class_annotations) != self.num_instance_images):
             raise Exception("number of class annotation is differnet from number of images!")
         
+        img_transforms = []
         segmap_transforms = []
 
         if resize:
-            segmap_transforms.append(
-                transforms.Resize(
-                    size, interpolation=transforms.InterpolationMode.NEAREST
+            resize_t = transforms.Resize(
+                    (size,size), interpolation=transforms.InterpolationMode.BILINEAR
+                )
+            img_transforms.append(resize_t)
+            segmap_transforms.append(transforms.Resize(
+                    (size, size), interpolation=transforms.InterpolationMode.NEAREST
                 )
             )
+        
         if center_crop:
-            segmap_transforms.append(transforms.CenterCrop(size))
+            center_crop_t = transforms.CenterCrop(size)
+            img_transforms.append(center_crop_t)
+            segmap_transforms.append(center_crop_t)
+
+        if color_jitter:
+            img_transforms.append(transforms.ColorJitter(0.2, 0.1))
+        
         if h_flip:
-            segmap_transforms.append(transforms.RandomHorizontalFlip())
-            
+            h_flip_t = transforms.RandomHorizontalFlip()
+            img_transforms.append(h_flip_t)
+            segmap_transforms.append(h_flip_t)
+
+        self.image_transforms = transforms.Compose(
+            [*img_transforms, transforms.ToTensor(), transforms.Normalize([0.5], [0.5])
+            ]
+        )
         self.segmap_transforms = transforms.Compose(
-            [*segmap_transforms, transforms.ToTensor()]
+            [*segmap_transforms, transforms.PILToTensor()]
         )
     
     def __get_class_annotations__(self):
@@ -257,10 +315,57 @@ class SegMapDataset(DreamBoothDataset):
             root = tree.getroot()
             annontation = root.find('object/name')
 
-            annotations += [self.instance_prompt + " " + voc_classes[annontation.text]]
+            annotations += [voc_classes[annontation.text]]
 
         return annotations
 
+    def __get_png_segmap_by_class__(self, img, voc_class):
+        seg_img = np.asarray(img)
+        
+        voc_class_pixel_val = self.voc_png_colormap_dict[voc_class]
+        void_pixel_val = self.voc_png_colormap_dict['void']
+        bg_pixel_val = self.voc_png_colormap_dict['background']
+
+        tmp_img = seg_img.copy()
+        tmp_img[tmp_img != voc_class_pixel_val] = bg_pixel_val
+
+        tmp_img = Image.fromarray(tmp_img.astype('uint8'))
+        tmp_img = tmp_img.convert('P')
+        tmp_img.putpalette(self.voc_colormap)
+
+        return tmp_img
+
+    def __get_rgb_segmap_by_class__(self, img, voc_class):
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        seg_img = np.asarray(img)
+        new_seg_img = seg_img.copy()
+
+        new_seg_img[~np.all(new_seg_img == self.voc_rgb_colormap_dict[voc_class], axis=-1)] = [0, 0, 0]
+        new_seg_img = Image.fromarray(new_seg_img)
+
+        if new_seg_img.mode != 'RGB':
+            new_seg_img = new_seg_img.convert('RGB')
+
+        return new_seg_img
+
+    def __get_bin_segmap_by_class__(self, img, voc_class):
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        seg_img = np.asarray(img)
+        new_seg_img = seg_img.copy()
+
+        new_seg_img[~np.all(new_seg_img == self.voc_rgb_colormap_dict[voc_class], axis=-1)] = [0, 0, 0]
+        new_seg_img[np.all(new_seg_img == self.voc_rgb_colormap_dict[voc_class], axis=-1)] = [255, 255, 255]
+        
+        new_seg_img = Image.fromarray(new_seg_img)
+
+        if new_seg_img.mode != 'RGB':
+            new_seg_img = new_seg_img.convert('RGB')
+
+        return new_seg_img
+
+    
     def __getitem__(self, index):
         example = {}
         img_path = self.instance_images_path[index % self.num_instance_images]
@@ -269,24 +374,32 @@ class SegMapDataset(DreamBoothDataset):
             #self.instance_images_path[index % self.num_instance_images]
             img_path
         )
-        ## Segmap
-        img_name, _ = os.path.splitext(img_name)
-        # segmap_img_path = Path(self.instance_segmap_data_root, img_name + '.png')
-        segmap_img_path = self.instance_segmap_images_path[index % self.num_instance_images]
-        segmap_instance_image = Image.open(segmap_img_path)
-        
+
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
-            
+
+        ## Segmap
+        segmap_img_path = self.instance_segmap_images_path[index % self.num_instance_images]
+        segmap_instance_image = Image.open(segmap_img_path)
+
+        # TODO, instead of converting to RGB to fit segmap image to the VAE
+        # Try replecating the image across 3 channels
         if not segmap_instance_image.mode == "RGB":
-            pass
-            segmap_instance_image = segmap_instance_image.convert("RGB")    
+            segmap_instance_image = segmap_instance_image.convert("RGB")
+            # segmap_instance_image = np.stack((segmap_instance_image,)*3, axis=-1)
+    
+        voc_class = self.class_annotations[index % self.num_instance_images]
+        # segmap_instance_image.save(f'{voc_class}_before.jpeg')
+        
+        # segmap_instance_image = self.__get_rgb_segmap_by_class__(segmap_instance_image, voc_class)
+        segmap_instance_image = self.__get_bin_segmap_by_class__(segmap_instance_image, voc_class)
+        # segmap_instance_image.save(f'{voc_class}.jpeg')
 
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_segmap_images"] = self.segmap_transforms(segmap_instance_image)
-        example["instance_classes"] = self.class_annotations[index % self.num_instance_images]
+        example["instance_classes"] = voc_class
         example["instance_prompt_ids"] = self.tokenizer(
-            self.class_annotations[index % self.num_instance_images],
+            self.instance_prompt + " " + voc_class,
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -307,12 +420,6 @@ class SegMapDataset(DreamBoothDataset):
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
-
-        # segmap_instance_image = Image.open(
-        #     self.instance_segmap_images_path[index % self.num_instance_images]
-        # )
-        # TODO check if conversion to RGB needed for more complex seg maps
-        # example["instance_segmap_images"] = self.image_transforms(segmap_instance_image)
 
         return example
 
@@ -690,11 +797,13 @@ def parse_args(input_args=None):
 
 
 def main(args):
-    main_device = 'cuda:4'
-    unet_device = 'cuda:5'
-    text_enc_device = 'cuda:4'
-    # text_enc_device = 
-
+    main_device = 'cuda:6'
+    unet_device = 'cuda:7'
+    text_enc_device = 'cuda:6'
+    text_enc_device = main_device 
+    if args.run_name:
+        args.output_dir = os.path.join(args.output_dir, args.run_name)
+        
     logging_dir = Path(args.output_dir, args.logging_dir)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -810,11 +919,11 @@ def main(args):
     # double the channels of the last layer of unet and set them to require_grad_(True)
     n_noise_pred_channels = unet.conv_out.out_channels
     if args.train_unet_segmentation:
-        tmp = unet.conv_out
-        new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
-        new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
+        # tmp = unet.conv_out
+        # new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
+        # new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
-        unet.conv_out = new_layer
+        # unet.conv_out = new_layer
         # unet.conv_out.weight.data.requires_grad_(False)
         # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
         unet.conv_out.requires_grad_(True)
@@ -947,16 +1056,17 @@ def main(args):
             size=args.resolution,
             center_crop=args.center_crop,
             color_jitter=args.color_jitter,
-            resize=True,
+            resize=args.resize,
         )
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
-
+        img = pixel_values[0]
+        save_tensor_as_img(img, './img.jpeg', normalized=True)
         if args.instance_segmap_data_root:
             seg_map_pixel_values = [example["instance_segmap_images"] for example in examples]
-
+            save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg')
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         if args.with_prior_preservation:
@@ -1037,20 +1147,18 @@ def main(args):
     unet.to(unet_device)
     print(f'unet device:{unet.device}')
     weight_dtype = torch.float32
-    # if accelerator.mixed_precision == "fp16":
-    #     weight_dtype = torch.float16
-    # elif accelerator.mixed_precision == "bf16":
-    #     weight_dtype = torch.bfloat16
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
 
     # Move text_encode and vae to gpu.
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
     #vae.to(accelerator.device, dtype=weight_dtype)
     vae.to(main_device, dtype=weight_dtype)
-    # segnet.to(main_device, dtype=weight_dtype)
     
     if not args.train_text_encoder:
-        #text_encoder.to(accelerator.device, dtype=weight_dtype)
         text_encoder.to(main_device, dtype=weight_dtype)
     else:
         text_encoder.to(text_enc_device, dtype=weight_dtype)
@@ -1076,10 +1184,6 @@ def main(args):
         * args.gradient_accumulation_steps
     )
 
-    # run_name = args.output_dir
-    if args.run_name:
-        args.output_dir = os.path.join(args.output_dir, args.run_name)
-        # run_name = os.path.join(run_name, args.run_name)
     writer = SummaryWriter(log_dir=args.output_dir)
     
     wandb_config = {
@@ -1118,14 +1222,16 @@ def main(args):
             text_encoder.train()
 
         for step, batch in enumerate(train_dataloader):
+            # save_tensor_as_img(batch['pixel_values'][0], 'img.jpeg', normalized=True)
             # Convert images to latent space
             latents = vae.encode(
                 batch["pixel_values"].to(main_device, dtype=weight_dtype)
             ).latent_dist.sample()
+            # decode_latents(latents, vae, './origin_sample.jpeg')
             latents = latents * 0.18215
-            # print(f'\n\nlatents shape:{latents.shape}\n\n')
 
             if args.instance_segmap_data_root:
+                # save_tensor_as_img(batch['segmap_pixel_values'][0], 'segmap_img.jpeg')
                 segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
                 segmap_latents = vae.encode(
                     segmap
@@ -1150,7 +1256,7 @@ def main(args):
 
             # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device)
-            # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
+
             # Predict the noise residual
             if not args.train_unet_segmentation:
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample # this is the noise prediction
@@ -1160,7 +1266,6 @@ def main(args):
                 timesteps = timesteps.to(unet_device)
                 encoder_hidden_states = encoder_hidden_states.to(unet_device)
                 unet_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample.to(main_device)
-                model_pred = unet_pred[:,:n_noise_pred_channels, :, :]
 
             # Get the target for loss depending on the prediction type
             if noise_scheduler.config.prediction_type == "epsilon":
@@ -1192,40 +1297,23 @@ def main(args):
                 # Add the prior loss to the instance loss.
                 loss = loss + args.prior_loss_weight * prior_loss
             else:
-                if args.train_unet_segmentation:
-                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
-                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
-                    mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
-                    loss = mse_loss.to(main_device)
-                    if min_loss is None or loss < min_loss:
-                        min_loss = loss
-                    wandb.log({'seg_loss' : loss})
-                    # Convert predicted segmap to logits
-                    # seg_pred = torch.softmax(seg_pred, dim=1)
-                    # Display predicted segmap
-                    if False and (global_step + 1) % (args.max_train_steps // 10) == 0:
-                        vae.to(main_device)
-                        seg_pred = vae.decode(seg_pred).sample.to(main_device)
-                        latents = latents.to(main_device)
-                        map = vae.decode(latents).sample.to(main_device)
-                        save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
-                        save_img(map, os.path.join(run_name, f'gt_decoded{global_step}.png'))
-                    # flatten output to pass through FC and softmax layer and restore its shape it can be passed to decoder
-                    # seg_pred_shape = seg_pred.shape
-                    # print(f'seg pred shape b4 linear:{seg_pred_shape}')
-                    # flat_seg_pred = seg_pred.view(1,-1)
-                    # print(f'noise_shape:{model_pred.shape} seg_shape:{seg_pred_shape} flat_seg_pred:{flat_seg_pred.shape}')
-                    # seg_pred = segnet(flat_seg_pred).view(1, 4, 64, 64) # TODO make more generic
-                    # seg_pred = segnet(flat_seg_pred)
-                    # print(f'seg_pred after linear:{seg_pred}')
-                    # seg_pred = seg_pred.view(seg_pred_shape)
-                    # seg_pred = vae.decode(seg_pred).sample.to(main_device) # decode latents to segmentation img
-                    # seg_pred = torch.softmax(seg_pred, dim=1)
-                    #print(f'pixel values:{torch.unique(segmap)}')                    
-                    # seg_loss = torch.nn.CrossEntropyLoss()
-                    # seg_loss = seg_loss(seg_pred.float(), segmap.float())
-                    # loss = seg_loss.to(main_device)                    
+                if args.train_unet_segmentation:                    
+                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :].to(unet_device) # this is noise
+                    # seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
+
+                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(unet_device)
+                    noise_scheduler.betas = noise_scheduler.betas.to(unet_device)
+                    noise_scheduler.alphas = noise_scheduler.alphas.to(unet_device)
                     
+                    pred_origin_sample = noise_scheduler.step(model_pred, timesteps, noisy_latents).pred_original_sample.to(main_device, dtype=torch.half)
+                    mse_loss = F.mse_loss(pred_origin_sample.float(), segmap_latents.float())
+                    # cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
+                    # labels = torch.ones(1).to(main_device)
+                    # loss = cosine_sim_loss(seg_pred.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
+                    # TODO save image of the decoded pred_origin_sample
+                    # decode_latents(pred_origin_sample, vae, './pred_origin_sample.jpeg')
+                    loss = mse_loss
+                    wandb.log({'seg_loss' : loss})
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -1295,10 +1383,10 @@ def main(args):
                                 target_replace_module=["CLIPAttention"],
                             )
                             
-                        if args.train_unet_segmentation and loss <= min_loss:
-                            torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
-                                        'segmentation_head' : segnet.state_dict()}
-                                        ,os.path.join(args.output_dir, f"unet_seg_weights_min_loss.pt"))
+                        # if args.train_unet_segmentation and loss <= min_loss:
+                        #     torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
+                        #                 'segmentation_head' : segnet.state_dict()}
+                        #                 ,os.path.join(args.output_dir, f"unet_seg_weights_min_loss.pt"))
 
 
                         for _up, _down in extract_lora_ups_down(pipeline.unet):
@@ -1375,7 +1463,8 @@ def main(args):
 
         if args.train_unet_segmentation:
             torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
-                        'segmentation_head' : segnet.state_dict()}
+                        # 'segmentation_head' : segnet.state_dict()
+                        }
                         ,os.path.join(args.output_dir,"unet_seg_weights.pt"))
 
     accelerator.end_training()
