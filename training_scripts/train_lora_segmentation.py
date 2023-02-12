@@ -782,7 +782,7 @@ def parse_args(input_args=None):
 
 
 def main(args):
-    main_device = 'cuda:6'
+    main_device = 'cuda:7'
     unet_device = 'cuda:7'
     text_enc_device = 'cuda:6'
     text_enc_device = main_device 
@@ -904,22 +904,23 @@ def main(args):
     # double the channels of the last layer of unet and set them to require_grad_(True)
     n_noise_pred_channels = unet.conv_out.out_channels
     if args.train_unet_segmentation:
-        tmp = unet.conv_out
-        new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
-        new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
+        # tmp = unet.conv_out
+        # new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
+        # new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
-        unet.conv_out = new_layer
-        unet.conv_out.weight.data.requires_grad_(False)
-        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
-        # unet.conv_out.requires_grad_(True)
-        # Add a fc layer with softmax to the added channels
-        n_features =  4 * 64 * 64
-        segnet = torch.nn.Sequential(
-            torch.nn.Linear(n_features, n_features),
-            #torch.nn.Softmax(dim=1)
-        )
-        segnet.requires_grad_(True)
-        segnet_params = segnet.parameters()
+        # unet.conv_out = new_layer
+        # unet.conv_out.weight.data.requires_grad_(False)
+        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        # # unet.conv_out.requires_grad_(True)
+        # # Add a fc layer with softmax to the added channels
+        # n_features =  4 * 64 * 64
+        # segnet = torch.nn.Sequential(
+        #     torch.nn.Linear(n_features, n_features),
+        #     #torch.nn.Softmax(dim=1)
+        # )
+        # segnet.requires_grad_(True)
+        # segnet_params = segnet.parameters()
+        unet.conv_out.requires_grad_(True)
 
     for _up, _down in extract_lora_ups_down(unet):
         # print("Before training: Unet First Layer lora up", _up.weight.data)
@@ -1203,7 +1204,7 @@ def main(args):
     last_save = 0
     min_loss = None
     num_inference_steps = 50 # TODO make this a parameter
-    strength = 0.5 # TODO make this a parameter
+    strength = 0.1 # TODO make this a parameter
     guidance_scale = 12  # TODO make this a parameter
 
     for epoch in range(args.num_train_epochs):
@@ -1216,7 +1217,7 @@ def main(args):
             # Convert images to latent space
             latents = vae.encode(
                 batch["pixel_values"].to(main_device, dtype=weight_dtype)
-            ).latent_dist.sample().to(unet_device)
+            ).latent_dist.sample().to(main_device)
             latents = latents * 0.18215
 
             if args.instance_segmap_data_root:
@@ -1226,6 +1227,7 @@ def main(args):
                     ).latent_dist.sample().to(main_device)
                 segmap_latents = segmap_latents * 0.18215 # TODO why this number?
 
+            vae = None
              # Get the text embedding for conditioning
             encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(unet_device)
             # encoder_hidden_states = torch.cat([encoder_hidden_states] * 2) # TODO uncomment when you have enough cuda memory
@@ -1239,11 +1241,13 @@ def main(args):
             latent_timestep = timesteps[:1].repeat(args.train_batch_size)
 
             # Add noise to the latents
-            noisy_latents = noise_scheduler.add_noise(latents, noise, latent_timestep).to(unet_device)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, latent_timestep).to(main_device)
             
             # Denoising loop
             num_warmup_steps = len(timesteps) - num_inference_steps * noise_scheduler.order
+            unet_devices = ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3', 'cuda:6']
             for i, t in enumerate(timesteps):
+                unet_device = unet_devices[i % len(unet_devices)]
                 mem_usg = torch.cuda.memory_allocated()
                 print(f'Start of Iteration {i} memory usage: {mem_usg}')
                 ''' expand the latents if we are doing classifier free guidance
@@ -1254,10 +1258,14 @@ def main(args):
 
                 # Predict the noise residual
                 t = t.to(unet_device)
+                noisy_latents = noisy_latents.to(unet_device)
+                unet = unet.to(unet_device)
+                encoder_hidden_states = encoder_hidden_states.to(unet_device)
                 noise_pred = unet(noisy_latents, t, encoder_hidden_states).sample
                 n_chnls = noise_pred.shape[1]
                 if args.train_unet_segmentation:
-                    seg_latents = noise_pred[:, n_chnls // 2:, :, :]
+                    # seg_latents = noise_pred[:, n_chnls // 2:, :, :]
+                    seg_latents = noise_pred
                     noise_pred = None # To freeup memory
                     # noise_pred = noise_pred[:, :n_chnls // 2, :, :]
 
@@ -1268,9 +1276,14 @@ def main(args):
                 ''' # TODO uncomment when you have enough cuda memory
 
                 # compute pervious noisy sample x_t -> x_{t-1}
+                seg_latents = seg_latents.to(unet_device)
+                t = t.to(unet_device)
+                noisy_latents = noisy_latents.to(unet_device)
+                # for ind in range(len( noise_scheduler.alphas_cumprod)):
+                #     noise_scheduler.alphas_cumprod[ind] = noise_scheduler.alphas_cumprod[ind].to(unet_device)
+                noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(unet_device)
                 noisy_latents = noise_scheduler.step(seg_latents, t, noisy_latents).prev_sample
                 seg_latents = None
-                t = None
                 mem_usg = torch.cuda.memory_allocated()
                 print(f'End of Iteration {i} memory usage: {mem_usg}')
             
@@ -1279,9 +1292,9 @@ def main(args):
             labels = torch.ones(1).to(main_device)
             noisy_latents = noisy_latents.to(main_device)
             loss = cosine_sim_loss(noisy_latents.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
-            wandb.log({'seg_loss' : loss})
-
-            accelerator.backward(loss)
+            # wandb.log({'seg_loss' : loss})
+            accelerator.device=main_device
+            accelerator.backward(loss.to(main_device))
             if accelerator.sync_gradients:
                 params_to_clip = (
                     itertools.chain(unet.parameters(), text_encoder.parameters())
