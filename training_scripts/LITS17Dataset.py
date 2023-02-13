@@ -112,7 +112,8 @@ class LITS17Dataset(dataset):
         seg_array = sitk.GetArrayFromImage(seg)[seg_slice]
 
         ct_img = self.__convert_slice_to_img__(ct_array)
-        seg_img = self.__convert_slice_to_img__(seg_array)
+        # seg_img = self.__convert_slice_to_img__(seg_array)
+        seg_img = self.__convert_segmap_to_rgb_hard__(seg_array)
 
         if self.tokenizer:
             example['instance_prompt_ids'] = self.tokenizer(
@@ -134,12 +135,36 @@ class LITS17Dataset(dataset):
         arr = slice
         if len(arr.shape) > 3:
             arr = arr.squeeze(0)
-        if arr.shape == 3:
-            arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
+        # if arr.shape == 3:
+        #     arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
 
         img = Image.fromarray(arr).convert('RGB')
 
         return img
+    
+    def __convert_segmap_to_rgb__(self, seg_arr):
+        seg_arr = seg_arr.astype(np.uint16)
+        seg_arr = seg_arr * 128
+        seg_arr = Image.fromarray(seg_arr).convert('RGB')
+
+        return seg_arr
+    
+    def __convert_segmap_to_rgb_hard__(self, seg_arr):
+        seg_arr = seg_arr.astype(np.uint8)
+        # create an empty image with the same shape as the input array
+        image = np.zeros((seg_arr.shape[0], seg_arr.shape[1], 3), dtype=np.uint8)
+        
+        # convert 0 values to (0, 0, 0)
+        image[seg_arr == 0] = [0, 0, 0]
+        
+        # convert 1 values to (128, 128, 128)
+        image[seg_arr == 1] = [128, 128, 128]
+        
+        # convert 2 values to (255, 255, 255)
+        image[seg_arr == 2] = [255, 255, 255]
+        
+        # convert the numpy array to a PIL image
+        return Image.fromarray(image)
     
     def __convert_slices_to_images__(self, ct_arr):
         ct_imgs = []
