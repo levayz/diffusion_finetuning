@@ -280,7 +280,7 @@ class SegMapDataset(DreamBoothDataset):
             ]
         )
         self.segmap_transforms = transforms.Compose(
-            [*segmap_transforms, transforms.PILToTensor()]
+            [*segmap_transforms]
         )
     
     def __get_class_annotations__(self):
@@ -350,18 +350,18 @@ class SegMapDataset(DreamBoothDataset):
         return new_seg_img
 
     def __get_bin_segmap_by_class__(self, img, voc_class):
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
+        '''
+        Gets png imaage and voc_class
+        Returns a torch tensor where all pixel that arent the class are (0,0,0) and (255,255,255) for the class
+        '''
         seg_img = np.asarray(img)
         new_seg_img = seg_img.copy()
 
-        new_seg_img[~np.all(new_seg_img == self.voc_rgb_colormap_dict[voc_class], axis=-1)] = [0, 0, 0]
-        new_seg_img[np.all(new_seg_img == self.voc_rgb_colormap_dict[voc_class], axis=-1)] = [255, 255, 255]
-        
-        new_seg_img = Image.fromarray(new_seg_img)
+        new_seg_img[new_seg_img != self.voc_png_colormap_dict[voc_class]] = 0
+        new_seg_img[new_seg_img == self.voc_png_colormap_dict[voc_class]] = 255
 
-        if new_seg_img.mode != 'RGB':
-            new_seg_img = new_seg_img.convert('RGB')
+        new_seg_img = np.repeat(new_seg_img[:, :, np.newaxis], 3, axis=2)
+        new_seg_img = torch.from_numpy(new_seg_img).permute(2, 0, 1)
 
         return new_seg_img
 
@@ -381,22 +381,16 @@ class SegMapDataset(DreamBoothDataset):
         ## Segmap
         segmap_img_path = self.instance_segmap_images_path[index % self.num_instance_images]
         segmap_instance_image = Image.open(segmap_img_path)
+        segmap_instance_image = self.segmap_transforms(segmap_instance_image)
 
-        # TODO, instead of converting to RGB to fit segmap image to the VAE
-        # Try replecating the image across 3 channels
-        if not segmap_instance_image.mode == "RGB":
-            segmap_instance_image = segmap_instance_image.convert("RGB")
-            # segmap_instance_image = np.stack((segmap_instance_image,)*3, axis=-1)
-    
         voc_class = self.class_annotations[index % self.num_instance_images]
         # segmap_instance_image.save(f'{voc_class}_before.jpeg')
         
-        # segmap_instance_image = self.__get_rgb_segmap_by_class__(segmap_instance_image, voc_class)
-        segmap_instance_image = self.__get_bin_segmap_by_class__(segmap_instance_image, voc_class)
+        segmap_instance_tensor = self.__get_bin_segmap_by_class__(segmap_instance_image, voc_class)
         # segmap_instance_image.save(f'{voc_class}.jpeg')
 
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_segmap_images"] = self.segmap_transforms(segmap_instance_image)
+        example["instance_segmap_images"] = segmap_instance_tensor
         example["instance_classes"] = voc_class
         example["instance_prompt_ids"] = self.tokenizer(
             self.instance_prompt + " " + voc_class,
@@ -1063,10 +1057,9 @@ def main(args):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
         img = pixel_values[0]
-        save_tensor_as_img(img, './img.jpeg', normalized=True)
+        # save_tensor_as_img(img, './img.jpeg', normalized=True)
         if args.instance_segmap_data_root:
             seg_map_pixel_values = [example["instance_segmap_images"] for example in examples]
-            save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg')
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
         if args.with_prior_preservation:
