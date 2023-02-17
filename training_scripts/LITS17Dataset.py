@@ -64,7 +64,7 @@ class LITS17Dataset(dataset):
             segmap_transforms.append(resize_t)
 
         self.image_transforms = transforms.Compose([*img_transforms, transforms.ToTensor()]) # TODO add transforms
-        self.segmap_transforms = transforms.Compose([*segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
+        self.segmap_transforms = transforms.Compose([transforms.ToPILImage(), *segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
 
     def __get_ct_file_names__(self, root_dir):
         ct_files = []
@@ -113,6 +113,7 @@ class LITS17Dataset(dataset):
 
         ct_img = self.__convert_slice_to_img__(ct_array)
         # seg_img = self.__convert_slice_to_img__(seg_array)
+        seg_img = self.segmap_transforms(seg_array)
         seg_img = self.__convert_segmap_to_rgb_hard__(seg_array)
 
         if self.tokenizer:
@@ -124,7 +125,7 @@ class LITS17Dataset(dataset):
             ).input_ids
 
         example['instance_image'] = self.image_transforms(ct_img)
-        example['instance_segmap_image'] = self.segmap_transforms(seg_img)
+        example['instance_segmap_image'] = seg_img
 
         return example
 
@@ -150,21 +151,33 @@ class LITS17Dataset(dataset):
         return seg_arr
     
     def __convert_segmap_to_rgb_hard__(self, seg_arr):
-        seg_arr = seg_arr.astype(np.uint8)
+        '''
+        input tensor of shape (H, W)
+        return tensor of shape (H, W, 3)
+        get tensor from np array
+        convert to RGB pixel values, 0 for bg, (128, 128, 128) for liver, (255, 255, 255) for tumor
+        returns tensor
+        '''
+        seg_arr = seg_arr.astype(np.int16)
         # create an empty image with the same shape as the input array
-        image = np.zeros((seg_arr.shape[0], seg_arr.shape[1], 3), dtype=np.uint8)
+        image = np.zeros((seg_arr.shape[0], seg_arr.shape[1], 3), dtype=np.int16)
         
+        # get number of unique values in seg array
+        unique_values = np.unique(seg_arr.flatten())
+        if len(unique_values) > 2:
+            print('tumor')
         # convert 0 values to (0, 0, 0)
         image[seg_arr == 0] = [0, 0, 0]
         
         # convert 1 values to (128, 128, 128)
-        image[seg_arr == 1] = [128, 128, 128]
+        image[seg_arr == 1] = [64, 64, 64]
         
         # convert 2 values to (255, 255, 255)
         image[seg_arr == 2] = [255, 255, 255]
         
-        # convert the numpy array to a PIL image
-        return Image.fromarray(image)
+        image = np.moveaxis(image, -1, 0) # move channel dimension to the front to be consisted with ct image
+        tensor = torch.from_numpy(image)
+        return tensor
     
     def __convert_slices_to_images__(self, ct_arr):
         ct_imgs = []
