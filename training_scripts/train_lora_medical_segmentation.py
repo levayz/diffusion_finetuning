@@ -76,8 +76,10 @@ def save_img(img, path):
     pil_img.save(path)
 
 def save_tensor_as_img(tensor, path, normalized=False):
+    if tensor.device != torch.device("cpu"):
+        tensor = tensor.detach().cpu()
     if normalized:
-        arr = np.array(tensor*255, dtype=np.uint8)
+        arr = np.array(tensor*62, dtype=np.uint8)
     else:
         arr = np.array(tensor, dtype=np.uint8)
     
@@ -602,9 +604,9 @@ def main(args):
         new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
         unet.conv_out = new_layer
-        # unet.conv_out.weight.data.requires_grad_(False)
-        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
-        unet.conv_out.requires_grad_(True)
+        unet.conv_out.weight.data.requires_grad_(False)
+        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        # unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
         segnet = torch.nn.Sequential(
@@ -971,25 +973,32 @@ def main(args):
                 if args.train_unet_segmentation:
                     model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
                     seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
-                    mse_loss = F.mse_loss(seg_pred.float(), segmap_latents.float())
-                    cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
-                    labels = torch.ones(1).to(main_device)
-                    loss = cosine_sim_loss(seg_pred.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
-                    # loss = mse_loss.to(main_device)
-                    if min_loss is None or loss < min_loss:
-                        min_loss = loss
-                    wandb.log({'seg_loss' : loss})
-                    # Convert predicted segmap to logits
-                    # seg_pred = torch.softmax(seg_pred, dim=1)
-                    # Display predicted segmap
-                    if False and (global_step + 1) % (args.max_train_steps // 10) == 0:
-                        vae.to(main_device)
-                        seg_pred = vae.decode(seg_pred).sample.to(main_device)
-                        latents = latents.to(main_device)
-                        map = vae.decode(latents).sample.to(main_device)
-                        save_img(seg_pred,os.path.join(run_name, f'test_{global_step}.png'))
-                        save_img(map, os.path.join(run_name, f'gt_decoded{global_step}.png'))           
+
+                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(main_device)
+                    noise_scheduler.betas = noise_scheduler.betas.to(main_device)
+                    noise_scheduler.alphas = noise_scheduler.alphas.to(main_device)
+                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(main_device)
                     
+                    timesteps = timesteps.to(main_device)
+                    segmap_latents = segmap_latents.to(main_device)
+                    noise.to(main_device)
+                    noisy_segmap_latents = noise_scheduler.add_noise(segmap_latents, noise, timesteps)
+                    noisy_latents = noisy_latents.to(main_device)
+                    prev_noisy_segmap_latents = noise_scheduler.step(noise, timesteps, noisy_segmap_latents).prev_sample
+                    pred_noisy_segmap_latents = noise_scheduler.step(seg_pred, timesteps, noisy_latents).prev_sample
+                    # reconstruction_loss = F.mse_loss(prev_noisy_segmap_latents.float(),segmap_latents.float())
+                    # prev_noisy_segmap = vae.decode(prev_noisy_segmap_latents).sample
+                    # pred_noisy_segmap = vae.decode(pred_noisy_segmap_latents).sample
+                    # save_tensor_as_img(prev_noisy_segmap[0], 'prev_noisy_segmap.png', normalized=True)
+                    # save_tensor_as_img(pred_noisy_segmap[0], 'pred_noisy_segmap.png', normalized=True)
+                    mse_loss = F.mse_loss(prev_noisy_segmap_latents.float(), pred_noisy_segmap_latents.float())
+                    loss = mse_loss
+                    # cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
+                    # labels = torch.ones(1).to(main_device)
+                    # loss = cosine_sim_loss(seg_pred.view(1,-1).float(), pred_noisy_segmap_latents.view(1,-1).float(), labels)
+                    # loss = mse_loss.to(main_device)
+                    wandb.log({'seg_loss' : loss})
+                    # wandb.log({'reconstruction_loss' : reconstruction_loss})
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
@@ -1059,10 +1068,10 @@ def main(args):
                                 target_replace_module=["CLIPAttention"],
                             )
                             
-                        if args.train_unet_segmentation and loss <= min_loss:
+                        if args.train_unet_segmentation:
                             torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
                                         'segmentation_head' : segnet.state_dict()}
-                                        ,os.path.join(args.output_dir, f"unet_seg_weights_min_loss.pt"))
+                                        ,os.path.join(args.output_dir, f"unet_seg_weights.pt"))
 
 
                         for _up, _down in extract_lora_ups_down(pipeline.unet):
