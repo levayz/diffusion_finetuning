@@ -16,6 +16,7 @@ from torchvision import transforms
 from PIL import Image
 import itertools
 import pickle
+from medclip import MedCLIPProcessor
 
 class LITS17Dataset(dataset):
     def __init__(self,
@@ -27,6 +28,7 @@ class LITS17Dataset(dataset):
                  center_crop=False,
                  num_slices=48,
                  resize=True,
+                 h_flip=True
                  path_slices_for_segmap=None,
                  path_slices_for_vol=None,
                  ):
@@ -37,6 +39,7 @@ class LITS17Dataset(dataset):
         self.prompt = prompt
         self.num_slices = num_slices
         self.resize = resize
+        self.h_flip = h_flip
 
         self.ct_dir = ct_dir
         self.seg_dir = seg_dir
@@ -62,6 +65,11 @@ class LITS17Dataset(dataset):
             resize_t = transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR)
             img_transforms.append(resize_t)
             segmap_transforms.append(resize_t)
+        
+        if self.h_flip:
+            h_flip_t = transforms.RandomHorizontalFlip(p=0.5)
+            img_transforms.append(h_flip_t)
+            segmap_transforms.append(h_flip_t)
 
         self.image_transforms = transforms.Compose([*img_transforms, transforms.ToTensor()]) # TODO add transforms
         self.segmap_transforms = transforms.Compose([transforms.ToPILImage(), *segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
@@ -123,6 +131,14 @@ class LITS17Dataset(dataset):
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
+        # For MedCLIP
+        # tokenizer_output = self.tokenizer(
+        #     text=self.prompt,
+        #     padding=False,
+        #     return_tensors='pt',
+        # )
+        # example['instance_prompt_ids'] = tokenizer_output['input_ids']
+        # example['attention_mask'] = tokenizer_output['attention_mask']
 
         example['instance_image'] = self.image_transforms(ct_img)
         example['instance_segmap_image'] = seg_img
@@ -164,8 +180,8 @@ class LITS17Dataset(dataset):
         
         # get number of unique values in seg array
         unique_values = np.unique(seg_arr.flatten())
-        if len(unique_values) > 2:
-            print('tumor')
+        # if len(unique_values) > 2:
+        #     print('tumor')
         # convert 0 values to (0, 0, 0)
         image[seg_arr == 0] = [0, 0, 0]
         
