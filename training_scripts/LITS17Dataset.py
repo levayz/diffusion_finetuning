@@ -28,7 +28,7 @@ class LITS17Dataset(dataset):
                  center_crop=False,
                  num_slices=48,
                  resize=True,
-                 h_flip=True
+                 h_flip=True,
                  path_slices_for_segmap=None,
                  path_slices_for_vol=None,
                  ):
