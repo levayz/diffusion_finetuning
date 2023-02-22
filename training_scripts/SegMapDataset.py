@@ -295,6 +295,7 @@ class SegMapDataset(DreamBoothDataset):
     def __getitem__(self, index):
         example = {}
         img_path = self.instance_images_path[index % self.__data_len__]
+        example['instance_images_path'] = str(img_path)
         _, img_name = os.path.split(img_path)
         instance_image = Image.open(
             img_path
@@ -306,7 +307,6 @@ class SegMapDataset(DreamBoothDataset):
         ## Segmap
         segmap_img_path = self.instance_segmap_images_path[index % self.__data_len__]
         segmap_instance_image = Image.open(segmap_img_path)
-        example['instance_images_clean'] = np.asarray(segmap_instance_image)
         
         segmap_instance_image = self.segmap_transforms(segmap_instance_image)
 
