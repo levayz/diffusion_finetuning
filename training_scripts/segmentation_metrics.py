@@ -230,7 +230,8 @@ def test_model_segmentation(img_dir,
                             max_examples=float('inf'),
                             bin_segmask_threshold=180,
                             strength=0.1,
-                            guidance_scale=12):
+                            guidance_scale=12,
+                            print_every=100):
     ds = SegMapDataset(img_dir, seg_dir, annotaitons_dir, 'segmentation map of', size=512, resize=True)
     dataloader = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=True)
     # print('hello')
@@ -264,7 +265,7 @@ def test_model_segmentation(img_dir,
         ap_mask_scores.append(APmask(output, seg_arr))
         ap_detect_scores.append(detect_object(output, seg_arr))
         
-        if step % 100 == 0:
+        if step % print_every == 0:
             print(f'mdice: {np.mean(dice_scores)}, miou: {np.mean(iou_scores)}, mAPmask: {np.mean(ap_mask_scores)}, mAPdetect: {np.mean(ap_detect_scores)}')
             print(prompt)
             plot_seg_arr(in_img ,seg_arr, output, origin_output)
@@ -308,7 +309,8 @@ def test_model_segmentation_on_unseen_classes(img_dir,
                                             max_examples=float('inf'),
                                             bin_segmask_threshold=180,
                                             strength=0.1,
-                                            guidance_scale=12):
+                                            guidance_scale=12,
+                                            print_every=100):
     
     ds = CocoStuffDataset(img_dir,
                           seg_dir,
@@ -353,7 +355,7 @@ def test_model_segmentation_on_unseen_classes(img_dir,
         ap_mask_scores.append(APmask(output, seg_arr))
         ap_detect_scores.append(detect_object(output, seg_arr))
         
-        if True or step % 100 == 0:
+        if step % print_every == 0:
             print(f'mdice: {np.mean(dice_scores)}, miou: {np.mean(iou_scores)}, mAPmask: {np.mean(ap_mask_scores)}, mAPdetect: {np.mean(ap_detect_scores)}')
             print(prompt)
             plot_seg_arr(in_img ,seg_arr, output, origin_output)
