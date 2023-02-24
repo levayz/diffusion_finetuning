@@ -3,7 +3,9 @@ from pathlib import Path
 from torchvision import transforms
 from PIL import Image
 import os
-from data.get_voc_color_by_class import get_voc_colormap_png, color_map, get_color_map_by_class_rgb
+import sys
+sys.path.append('/disk4/Lev/Projects/diffusion_finetuning/data')
+from get_voc_color_by_class import get_voc_colormap_png, color_map, get_color_map_by_class_rgb
 import xml.etree.ElementTree as ET
 import numpy as np
 import torch
@@ -235,6 +237,7 @@ class SegMapDataset(DreamBoothDataset):
         images_names = [os.path.splitext(os.path.basename(path))[0] for path in self.instance_segmap_images_path]
         xmls_paths = [os.path.join(self.annotations_root, img_name +'.xml') for img_name in images_names]
     
+    
         annotations = []
         for path in xmls_paths:
             tree = ET.parse(path).getroot()
@@ -306,6 +309,7 @@ class SegMapDataset(DreamBoothDataset):
 
         ## Segmap
         segmap_img_path = self.instance_segmap_images_path[index % self.__data_len__]
+        example['instance_segmap_images_path'] = str(segmap_img_path)
         segmap_instance_image = Image.open(segmap_img_path)
         
         segmap_instance_image = self.segmap_transforms(segmap_instance_image)
