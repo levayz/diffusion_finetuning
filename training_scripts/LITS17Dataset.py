@@ -23,12 +23,13 @@ class LITS17Dataset(dataset):
                  ct_dir,
                  seg_dir,
                  prompt,
+                 organ,
                  tokenizer=None,
                  size=512,
                  center_crop=False,
                  num_slices=48,
                  resize=True,
-                 h_flip=True,
+                 h_flip=False,
                  path_slices_for_segmap=None,
                  path_slices_for_vol=None,
                  ):
@@ -37,6 +38,7 @@ class LITS17Dataset(dataset):
         self.center_crop = center_crop
         self.tokenizer = tokenizer
         self.prompt = prompt
+        self.organ = organ
         self.num_slices = num_slices
         self.resize = resize
         self.h_flip = h_flip
@@ -49,7 +51,9 @@ class LITS17Dataset(dataset):
         
         self.ct_list = list(map(lambda x: os.path.join(ct_dir, x), self.ct_list))
         self.seg_list = list(map(lambda x: os.path.join(seg_dir, x), self.seg_list))
-
+        
+        assert 'segmentation map of ' in self.prompt
+        
         if path_slices_for_segmap:
             self.ct_list_w_slices = self.__create_list_w_slices_from_pickle__(path_slices_for_vol)
             self.seg_list_w_slices = self.__create_list_w_slices_from_pickle__(path_slices_for_segmap)
@@ -64,15 +68,12 @@ class LITS17Dataset(dataset):
         if self.resize:
             resize_t = transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR)
             img_transforms.append(resize_t)
-            segmap_transforms.append(resize_t)
+            resize_segmap_t = transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST)
+            segmap_transforms.append(resize_segmap_t)
+            # resize of segmap is taken care of elsewhere
         
-        if self.h_flip:
-            h_flip_t = transforms.RandomHorizontalFlip(p=0.5)
-            img_transforms.append(h_flip_t)
-            segmap_transforms.append(h_flip_t)
-
         self.image_transforms = transforms.Compose([*img_transforms, transforms.ToTensor()]) # TODO add transforms
-        self.segmap_transforms = transforms.Compose([transforms.ToPILImage(), *segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
+        self.segmap_transforms = transforms.Compose([transforms.ToPILImage(),*segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
 
     def __get_ct_file_names__(self, root_dir):
         ct_files = []
@@ -118,11 +119,17 @@ class LITS17Dataset(dataset):
 
         ct_array = sitk.GetArrayFromImage(ct)[ct_slice]
         seg_array = sitk.GetArrayFromImage(seg)[seg_slice]
-
+        
+        if self.h_flip and random.random() > 0.5:
+            ct_array = np.fliplr(ct_array)
+            seg_array = np.fliplr(seg_array)
+            
+        
+        seg_img = self.__convert_segmap_to_rgb_hard__(seg_array) # torch tensor
+        # seg_img = self.__convert_slice_to_img__(seg_img)
         ct_img = self.__convert_slice_to_img__(ct_array)
-        # seg_img = self.__convert_slice_to_img__(seg_array)
-        seg_img = self.segmap_transforms(seg_array)
-        seg_img = self.__convert_segmap_to_rgb_hard__(seg_array)
+
+        seg_img = self.segmap_transforms(seg_img)
 
         if self.tokenizer:
             example['instance_prompt_ids'] = self.tokenizer(
@@ -131,18 +138,15 @@ class LITS17Dataset(dataset):
                 truncation=True,
                 max_length=self.tokenizer.model_max_length,
             ).input_ids
-        # For MedCLIP
-        # tokenizer_output = self.tokenizer(
-        #     text=self.prompt,
-        #     padding=False,
-        #     return_tensors='pt',
-        # )
-        # example['instance_prompt_ids'] = tokenizer_output['input_ids']
-        # example['attention_mask'] = tokenizer_output['attention_mask']
-
+            example['organ_prompt_ids'] = self.tokenizer(
+                self.organ,
+                padding='do_not_pad',
+                truncation=True,
+                max_length=self.tokenizer.model_max_length,
+            ).input_ids
+            
         example['instance_image'] = self.image_transforms(ct_img)
         example['instance_segmap_image'] = seg_img
-
         return example
 
     def __len__(self):
@@ -156,11 +160,12 @@ class LITS17Dataset(dataset):
         #     arr = np.moveaxis(arr, [0, 1, 2], [2, 0, 1])
 
         img = Image.fromarray(arr).convert('RGB')
-
+        # if self.resize:
+        #     img = img.resize([self.size, self.size], resample=Image.NEAREST)
         return img
     
     def __convert_segmap_to_rgb__(self, seg_arr):
-        seg_arr = seg_arr.astype(np.uint16)
+        seg_arr = seg_arr.astype(np.uint8)
         seg_arr = seg_arr * 128
         seg_arr = Image.fromarray(seg_arr).convert('RGB')
 
@@ -174,7 +179,7 @@ class LITS17Dataset(dataset):
         convert to RGB pixel values, 0 for bg, (128, 128, 128) for liver, (255, 255, 255) for tumor
         returns tensor
         '''
-        seg_arr = seg_arr.astype(np.int16)
+        seg_arr = seg_arr.astype(np.uint8)
         # create an empty image with the same shape as the input array
         image = np.zeros((seg_arr.shape[0], seg_arr.shape[1], 3), dtype=np.int16)
         
@@ -192,7 +197,7 @@ class LITS17Dataset(dataset):
         image[seg_arr == 2] = [255, 255, 255]
         
         image = np.moveaxis(image, -1, 0) # move channel dimension to the front to be consisted with ct image
-        tensor = torch.from_numpy(image)
+        tensor = torch.from_numpy(image).to(dtype=torch.uint8)
         return tensor
     
     def __convert_slices_to_images__(self, ct_arr):
