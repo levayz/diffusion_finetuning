@@ -12,12 +12,13 @@ from torch.utils.data import Dataset as dataset
 
 import fnmatch
 from torchvision import transforms
+import torch.nn.functional as F
 
 from PIL import Image
 import itertools
 import pickle
 from medclip import MedCLIPProcessor
-
+from scipy.ndimage import rotate
 class LITS17Dataset(dataset):
     def __init__(self,
                  ct_dir,
@@ -27,9 +28,11 @@ class LITS17Dataset(dataset):
                  tokenizer=None,
                  size=512,
                  center_crop=False,
+                 color_jitter=False,
                  num_slices=48,
                  resize=True,
                  h_flip=False,
+                 rand_rotate=False,
                  path_slices_for_segmap=None,
                  path_slices_for_vol=None,
                  ):
@@ -42,13 +45,17 @@ class LITS17Dataset(dataset):
         self.num_slices = num_slices
         self.resize = resize
         self.h_flip = h_flip
+        self.rand_rotate = rand_rotate
 
         self.ct_dir = ct_dir
         self.seg_dir = seg_dir
 
         self.ct_list = self.__get_ct_file_names__(ct_dir)
-        self.seg_list = list(map(lambda x: x.replace('volume', 'segmentation'), self.ct_list))
-        
+        if ct_dir == seg_dir:
+            self.seg_list = list(map(lambda x: x.replace('volume', 'segmentation'), self.ct_list))
+        else:
+            self.seg_list = self.ct_list
+            
         self.ct_list = list(map(lambda x: os.path.join(ct_dir, x), self.ct_list))
         self.seg_list = list(map(lambda x: os.path.join(seg_dir, x), self.seg_list))
         
@@ -65,21 +72,28 @@ class LITS17Dataset(dataset):
 
         img_transforms = []
         segmap_transforms = []
+        if self.center_crop:
+            center_crop = transforms.CenterCrop(size)
+            img_transforms.append(center_crop)
+            segmap_transforms.append(center_crop)
         if self.resize:
             resize_t = transforms.Resize((size, size), interpolation=transforms.InterpolationMode.BILINEAR)
             img_transforms.append(resize_t)
             resize_segmap_t = transforms.Resize((size, size), interpolation=transforms.InterpolationMode.NEAREST)
             segmap_transforms.append(resize_segmap_t)
             # resize of segmap is taken care of elsewhere
-        
+        if color_jitter:
+            img_transforms.append(transforms.ColorJitter(0.2, 0.1))
+            
         self.image_transforms = transforms.Compose([*img_transforms, transforms.ToTensor()]) # TODO add transforms
         self.segmap_transforms = transforms.Compose([transforms.ToPILImage(),*segmap_transforms, transforms.PILToTensor()]) # TODO add transforms
 
     def __get_ct_file_names__(self, root_dir):
         ct_files = []
         for dirpath, dirnames, filenames in os.walk(root_dir):
-            for filename in fnmatch.filter(filenames, '*volume*'):
-                ct_files.append(filename)
+            for filename in fnmatch.filter(filenames, '*.nii*'):
+                if not filename.startswith('.'):
+                    ct_files.append(filename)
         return ct_files
     
     def __create_list_w_slices_from_pickle__(self, path):
@@ -114,15 +128,21 @@ class LITS17Dataset(dataset):
         # print(f'ct path:{ct_path} slice:{ct_slice}')
         # print(f'seg path:{seg_path} slice:{seg_slice}')
         
-        ct = sitk.ReadImage(ct_path, sitk.sitkUInt8)
-        seg = sitk.ReadImage(seg_path, sitk.sitkUInt8)
+        ct = sitk.ReadImage(ct_path)
+        seg = sitk.ReadImage(seg_path)
 
         ct_array = sitk.GetArrayFromImage(ct)[ct_slice]
         seg_array = sitk.GetArrayFromImage(seg)[seg_slice]
+        seg_array[seg_array != 1] = 0 # TODO make more general or put in a function
         
         if self.h_flip and random.random() > 0.5:
             ct_array = np.fliplr(ct_array)
             seg_array = np.fliplr(seg_array)
+            
+        if self.rand_rotate and random.random() > 0.5:
+            deg = random.randint(0, 360)
+            ct_array = rotate(ct_array, deg, reshape=False)
+            seg_array = rotate(seg_array, deg, reshape=False)
             
         
         seg_img = self.__convert_segmap_to_rgb_hard__(seg_array) # torch tensor
@@ -191,7 +211,7 @@ class LITS17Dataset(dataset):
         image[seg_arr == 0] = [0, 0, 0]
         
         # convert 1 values to (128, 128, 128)
-        image[seg_arr == 1] = [64, 64, 64]
+        image[seg_arr == 1] = [255, 255, 255]
         
         # convert 2 values to (255, 255, 255)
         image[seg_arr == 2] = [255, 255, 255]
