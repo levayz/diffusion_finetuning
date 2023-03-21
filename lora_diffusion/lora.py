@@ -37,7 +37,7 @@ class LoraInjectedLinear(nn.Module):
             raise ValueError(
                 f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
             )
-
+        self.rank = r
         self.linear = nn.Linear(in_features, out_features, bias)
         self.lora_down = nn.Linear(in_features, r, bias=False)
         self.lora_up = nn.Linear(r, out_features, bias=False)
@@ -48,6 +48,26 @@ class LoraInjectedLinear(nn.Module):
 
     def forward(self, input):
         return self.linear(input) + self.lora_up(self.lora_down(input)) * self.scale
+
+class LoraInjectedLinearOnLora(nn.Module):
+    def __init__(self, in_features, out_features, bias=False, r_prev_lora=4, r_curr_lora=4, dtype=torch.float16):
+        super().__init__()
+
+        if r_curr_lora > min(in_features, out_features):
+            raise ValueError(
+                f"LoRA rank {r_curr_lora} must be less or equal than {min(in_features, out_features)}"
+            )
+        self.rank=r_curr_lora
+        self.lora_linear = LoraInjectedLinear(in_features, out_features, bias, r_prev_lora).to(dtype)
+        self.lora_up = nn.Linear(r_curr_lora, out_features, bias=False).to(dtype)
+        self.lora_down = nn.Linear(in_features, r_curr_lora, bias=False).to(dtype)
+        self.scale = 1.0
+
+        nn.init.normal_(self.lora_down.weight, std=1 / r_curr_lora)
+        nn.init.zeros_(self.lora_up.weight)
+
+    def forward(self, input):
+        return self.lora_linear(input) + self.lora_up(self.lora_down(input)) * self.scale
 
 
 UNET_DEFAULT_TARGET_REPLACE = {"CrossAttention", "Attention", "GEGLU"}
@@ -173,8 +193,66 @@ def inject_trainable_lora(
         require_grad_params.append(_module._modules[name].lora_down.parameters())
 
         if loras != None:
-            _module._modules[name].lora_up.weight = loras.pop(0)
-            _module._modules[name].lora_down.weight = loras.pop(0)
+            layer_weight = nn.Parameter(loras.pop(0).float())
+            _module._modules[name].lora_up.weight = layer_weight
+            layer_weight = nn.Parameter(loras.pop(0).float())
+            _module._modules[name].lora_down.weight = layer_weight
+
+        _module._modules[name].lora_up.weight.requires_grad = True
+        _module._modules[name].lora_down.weight.requires_grad = True
+        names.append(name)
+
+    return require_grad_params, names
+
+def inject_trainable_lora_on_lora(
+    model: nn.Module,
+    target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
+    r: int = 3,
+    loras=None,  # path to lora .pt
+):
+    """
+    inject lora into model on top of another lora, and returns lora parameter groups.
+    """
+
+    require_grad_params = []
+    names = []
+
+    if loras != None:
+        loras = torch.load(loras)
+
+    for _module, name, _child_module in _find_modules(
+        model, target_replace_module, search_class=[LoraInjectedLinear]
+    ):
+        linear_lora_weight = _child_module.linear.weight
+        prev_lora_up_weight = _child_module.lora_up.weight
+        prev_lora_down_weight = _child_module.lora_down.weight
+        bias = _child_module.linear.bias
+        
+        _tmp = LoraInjectedLinearOnLora(
+            _child_module.linear.in_features,
+            _child_module.linear.out_features,
+            _child_module.linear.bias is not None,
+            _child_module.rank,
+            r,
+        )
+        _tmp.lora_linear.weight = linear_lora_weight
+        _tmp.lora_up.weight = prev_lora_up_weight
+        _tmp.lora_down.weight = prev_lora_down_weight
+        if bias is not None:
+            _tmp.lora_linear.bias = bias
+
+        # switch the module
+        _tmp.to(_child_module.linear.weight.device).to(_child_module.linear.weight.dtype)
+        _module._modules[name] = _tmp
+
+        require_grad_params.append(_module._modules[name].lora_up.parameters())
+        require_grad_params.append(_module._modules[name].lora_down.parameters())
+
+        if loras != None:
+            layer_weight = nn.Parameter(loras.pop(0).float())
+            _module._modules[name].lora_up.weight = layer_weight
+            layer_weight = nn.Parameter(loras.pop(0).float())
+            _module._modules[name].lora_down.weight = layer_weight
 
         _module._modules[name].lora_up.weight.requires_grad = True
         _module._modules[name].lora_down.weight.requires_grad = True
@@ -183,14 +261,21 @@ def inject_trainable_lora(
     return require_grad_params, names
 
 
-def extract_lora_ups_down(model, target_replace_module=DEFAULT_TARGET_REPLACE):
+
+
+def extract_lora_ups_down(model, target_replace_module=DEFAULT_TARGET_REPLACE, extract_lora_lora=False):
 
     loras = []
 
     for _m, _n, _child_module in _find_modules(
-        model, target_replace_module, search_class=[LoraInjectedLinear]
+        model, target_replace_module, search_class=[LoraInjectedLinear, LoraInjectedLinearOnLora]
     ):
-        loras.append((_child_module.lora_up, _child_module.lora_down))
+        if isinstance(_child_module, LoraInjectedLinear):
+            loras.append((_child_module.lora_up, _child_module.lora_down))
+        elif isinstance(_child_module, LoraInjectedLinearOnLora) and extract_lora_lora:
+            print('extracting lora lora')
+            loras.append((_child_module.lora_up, _child_module.lora_down))
+            # loras.append((_child_module.lora_linear, _child_module.lora_linear))
 
     if len(loras) == 0:
         raise ValueError("No lora injected.")
@@ -202,10 +287,11 @@ def save_lora_weight(
     model,
     path="./lora.pt",
     target_replace_module=DEFAULT_TARGET_REPLACE,
+    extract_lora_lora=False,
 ):
     weights = []
     for _up, _down in extract_lora_ups_down(
-        model, target_replace_module=target_replace_module
+        model, target_replace_module=target_replace_module, extract_lora_lora=extract_lora_lora
     ):
         weights.append(_up.weight.to("cpu").to(torch.float16))
         weights.append(_down.weight.to("cpu").to(torch.float16))
@@ -458,6 +544,47 @@ def monkeypatch_lora(
 
         _module._modules[name].to(weight.device)
 
+def monkeypatch_lora_lora(
+    model, loras, target_replace_module=DEFAULT_TARGET_REPLACE, r: int = 4
+):
+    for _module, name, _child_module in _find_modules(
+        model, target_replace_module, search_class=[LoraInjectedLinear]
+    ):
+        # save the previous lora layer weights
+        weight = _child_module.linear.weight
+        prev_lora_up_weight = _child_module.lora_up.weight
+        prev_lora_down_weight = _child_module.lora_down.weight
+        bias = _child_module.linear.bias if _child_module.linear.bias is not None else None
+        _tmp = LoraInjectedLinearOnLora(
+            _child_module.linear.in_features,
+            _child_module.linear.out_features,
+            _child_module.linear.bias is not None,
+            _child_module.rank,
+            r,
+        )
+        # set the weights of the LinearLora to previous saved weights
+        _tmp.lora_linear.linear.weight = weight
+        _tmp.lora_linear.lora_up.weight = prev_lora_up_weight
+        _tmp.lora_linear.lora_down.weight = prev_lora_down_weight
+        if bias is not None:
+            _tmp.lora_linear.bias = bias
+
+        # switch the module
+        _module._modules[name] = _tmp
+
+        up_weight = loras.pop(0)
+        down_weight = loras.pop(0)
+
+        _module._modules[name].lora_up.weight = nn.Parameter(
+            up_weight.type(weight.dtype)
+        )
+        _module._modules[name].lora_down.weight = nn.Parameter(
+            down_weight.type(weight.dtype)
+        )
+
+        _module._modules[name].to(weight.device)
+
+
 
 def monkeypatch_replace_lora(
     model, loras, target_replace_module=DEFAULT_TARGET_REPLACE, r: int = 4
@@ -525,7 +652,7 @@ def monkeypatch_or_replace_lora(
         # switch the module
         _module._modules[name] = _tmp
 
-        up_weight = loras.pop(0)
+        up_weight = loras.pop(0) # importand to pop according to order of saved weights in save_lora_weight
         down_weight = loras.pop(0)
 
         _module._modules[name].lora_up.weight = nn.Parameter(
@@ -599,6 +726,10 @@ def tune_lora_scale(model, alpha: float = 1.0):
         if _module.__class__.__name__ == "LoraInjectedLinear":
             _module.scale = alpha
 
+def tune_lora_lora_scale(model, alpha: float = 1.0):
+    for _module in model.modules():
+        if _module.__class__.__name__ == "LoraInjectedLinearOnLora":
+            _module.scale = alpha
 
 def _text_lora_path(path: str) -> str:
     assert path.endswith(".pt"), "Only .pt files are supported"
