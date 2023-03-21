@@ -21,15 +21,15 @@ from accelerate.utils import set_seed
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    #StableDiffusionPipeline,
-    #UNet2DConditionModel,
+    StableDiffusionPipeline,
+    UNet2DConditionModel,
 )
 import sys
 sys.path.append('/disk4/Lev/Projects/diffusion_finetuning/') # Need this to import files from the diffusers folder
 print(sys.path)
 
-from diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
-from diffusers.models.unet_2d_condition import UNet2DConditionModel
+# from my_diffusers.pipelines.stable_diffusion import StableDiffusionPipeline
+# from my_diffusers.models.unet_2d_condition import UNet2DConditionModel
 
 from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
@@ -40,6 +40,7 @@ from transformers import CLIPTextModel, CLIPTokenizer
 from lora_diffusion import (
     extract_lora_ups_down,
     inject_trainable_lora,
+    inject_trainable_lora_on_lora,
     safetensors_available,
     save_lora_weight,
     save_safeloras,
@@ -67,7 +68,6 @@ import wandb
 
 from data.get_voc_color_by_class import get_voc_colormap_png, color_map, get_color_map_by_class_rgb
 from LITS17Dataset import LITS17Dataset
-
 def save_img(img, path):
     img = img.cpu()
     np_img = img.detach().numpy().squeeze()
@@ -160,10 +160,17 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--train_unet_segmentation",
-        default=False,
+        default=True,
         required=False,
         action="store_true",
         help="add extra channels to unet model for segmentation and train them",
+    )
+    parser.add_argument(
+        "--finetune_unet_segmentation",
+        default=False,
+        required=False,
+        action="store_true",
+        help="add another lora layer to unet for finetuning",
     )
     parser.add_argument(
         "--run_name",
@@ -206,6 +213,13 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="The prompt with identifier specifying the instance",
+    )
+    parser.add_argument(
+        "--organ",
+        type=str,
+        default=None,
+        required=True,
+        help="organ training on",
     )
     parser.add_argument(
         "--class_prompt",
@@ -440,6 +454,7 @@ def parse_args(input_args=None):
 
     if input_args is not None:
         args = parser.parse_args(input_args)
+        print(args)
     else:
         args = parser.parse_args()
 
@@ -477,9 +492,9 @@ def parse_args(input_args=None):
 
 
 def main(args):
-    main_device = 'cuda:6'
-    unet_device = 'cuda:7'
-    text_enc_device = 'cuda:6'
+    main_device = 'cuda:0'
+    unet_device = 'cuda:1'
+    # text_enc_device = 'cuda:1'
     text_enc_device = main_device 
     if args.run_name:
         args.output_dir = os.path.join(args.output_dir, args.run_name)
@@ -581,6 +596,9 @@ def main(args):
         subfolder="text_encoder",
         revision=args.revision,
     )
+    text_encoder.load_state_dict(torch.load('/disk4/Lev/Projects/diffusion_finetuning/training_scripts/clip_text_encoder_weights.pt',
+                                            map_location=torch.device('cpu')))
+    print('***Loaded text encoder weights from /disk4/Lev/Projects/diffusion_finetuning/training_scripts/clip_text_encoder_weights.pt***')
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
         subfolder=None if args.pretrained_vae_name_or_path else "vae",
@@ -595,7 +613,8 @@ def main(args):
     unet_lora_params, _ = inject_trainable_lora(
         unet, r=args.lora_rank, loras=args.resume_unet
     )
-
+    print(f'loaded first lora with rank {args.lora_rank}')
+    
     # double the channels of the last layer of unet and set them to require_grad_(True)
     n_noise_pred_channels = unet.conv_out.out_channels
     if args.train_unet_segmentation:
@@ -604,9 +623,9 @@ def main(args):
         new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
         unet.conv_out = new_layer
-        unet.conv_out.weight.data.requires_grad_(False)
-        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
-        # unet.conv_out.requires_grad_(True)
+        # unet.conv_out.weight.data.requires_grad_(False)
+        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
         segnet = torch.nn.Sequential(
@@ -616,7 +635,23 @@ def main(args):
         segnet.requires_grad_(True)
         segnet_params = segnet.parameters()
 
-    for _up, _down in extract_lora_ups_down(unet):
+    if args.resume_unet:
+        # remove base name from args.resume_unet
+        chkpt = torch.load(os.path.join(os.path.dirname(args.resume_unet),"unet_seg_weights.pt"), map_location=unet.device)
+        unet.conv_out.load_state_dict(chkpt['conv_out_state_dict'])
+        unet.conv_out.requires_grad_(True)
+        print("resuming unet from checkpoint with grad on conv_out")
+        print('***unet loaded from checkpoint... resuming...***')
+
+    if args.finetune_unet_segmentation:
+        # TODO add another layer of lora, dont optimize the previous lora
+        unet.requires_grad_(False)
+        unet_lora_params, _ = inject_trainable_lora_on_lora(
+            unet, r=3,
+        )
+
+    
+    for _up, _down in extract_lora_ups_down(unet, extract_lora_lora=True if args.finetune_unet_segmentation else False):
         # print("Before training: Unet First Layer lora up", _up.weight.data)
         # print("Before training: Unet First Layer lora down", _down.weight.data)
         break
@@ -712,39 +747,33 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="scheduler"
     )
 
-    if not args.instance_segmap_data_root:
-        train_dataset = DreamBoothDataset(
-            instance_data_root=args.instance_data_dir,
-            instance_prompt=args.instance_prompt,
-            class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-            class_prompt=args.class_prompt,
-            tokenizer=tokenizer,
-            size=args.resolution,
-            center_crop=args.center_crop,
-            color_jitter=args.color_jitter,
-            resize=args.resize,
-        )
-    else:
-        train_dataset = LITS17Dataset(
-            ct_dir=args.instance_data_dir,
-            seg_dir=args.instance_segmap_data_root,
-            prompt=args.instance_prompt,
-            tokenizer=tokenizer,
-            size=args.resolution,
-            center_crop=args.center_crop,
-            resize=args.resize,
-            path_slices_for_segmap=args.seg_slices_pkl,
-            path_slices_for_vol=args.vol_slices_pkl,
-        )
+    train_dataset = LITS17Dataset(
+        ct_dir=args.instance_data_dir,
+        seg_dir=args.instance_segmap_data_root,
+        prompt=args.instance_prompt,
+        organ=args.organ,
+        tokenizer=tokenizer,
+        size=args.resolution,
+        center_crop=args.center_crop,
+        color_jitter=args.color_jitter,
+        resize=True,
+        h_flip=True,
+        rand_rotate=False,
+        path_slices_for_segmap=args.seg_slices_pkl,
+        path_slices_for_vol=args.vol_slices_pkl,
+    )
+    
+    print("train_dataset_size", len(train_dataset))
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
+        organ_input_ids = [example["organ_prompt_ids"] for example in examples]
         pixel_values = [example["instance_image"] for example in examples]
         img = pixel_values[0]
-        # save_tensor_as_img(img, './img.jpeg', normalized=True)
+        save_tensor_as_img(img, './img.jpeg', normalized=True)
         if args.instance_segmap_data_root:
             seg_map_pixel_values = [example["instance_segmap_image"] for example in examples]
-            # save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg', normalized=True)
+            save_tensor_as_img(seg_map_pixel_values[0], './segmap_img.jpeg', normalized=True)
         
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -759,16 +788,25 @@ def main(args):
             max_length=tokenizer.model_max_length,
             return_tensors="pt",
         ).input_ids
+        
+        organ_input_ids = tokenizer.pad(
+            {"input_ids": organ_input_ids},
+            padding="max_length",
+            max_length=tokenizer.model_max_length,
+            return_tensors="pt",
+        ).input_ids
 
         if args.instance_segmap_data_root:
             batch = {
                 "input_ids": input_ids,
+                "organ_input_ids": organ_input_ids,
                 "pixel_values": pixel_values,
                 "segmap_pixel_values" : seg_map_pixel_values,
             }
         else:
             batch = {
                 "input_ids": input_ids,
+                "organ_input_ids": organ_input_ids,
                 "pixel_values": pixel_values,
             }
 
@@ -903,12 +941,11 @@ def main(args):
             ).latent_dist.sample()
             latents = latents * 0.18215
 
-            if args.instance_segmap_data_root:
-                segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
-                segmap_latents = vae.encode(
-                    segmap
-                    ).latent_dist.sample().to(main_device)
-                segmap_latents = segmap_latents * 0.18215 # TODO why this number?
+            segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
+            segmap_latents = vae.encode(
+                segmap
+                ).latent_dist.sample().to(main_device)
+            segmap_latents = segmap_latents * 0.18215 # TODO why this number?
 
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
@@ -927,7 +964,8 @@ def main(args):
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device)
+            encoder_hidden_states = text_encoder(batch["input_ids"].to(text_enc_device))[0].to(main_device, dtype=weight_dtype)
+            organ_hidden_states  = text_encoder(batch["organ_input_ids"].to(text_enc_device))[0].to(main_device, dtype=weight_dtype)
             # print(f'\n\nencoder hidden states shape: {encoder_hidden_states.shape}\n\n')
             # Predict the noise residual
             if not args.train_unet_segmentation:
@@ -972,7 +1010,7 @@ def main(args):
             else:
                 if args.train_unet_segmentation:
                     model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
-                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device)
 
                     noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(main_device)
                     noise_scheduler.betas = noise_scheduler.betas.to(main_device)
@@ -985,19 +1023,20 @@ def main(args):
                     noisy_segmap_latents = noise_scheduler.add_noise(segmap_latents, noise, timesteps)
                     noisy_latents = noisy_latents.to(main_device)
                     prev_noisy_segmap_latents = noise_scheduler.step(noise, timesteps, noisy_segmap_latents).prev_sample
-                    pred_noisy_segmap_latents = noise_scheduler.step(seg_pred, timesteps, noisy_latents).prev_sample
-                    # reconstruction_loss = F.mse_loss(prev_noisy_segmap_latents.float(),segmap_latents.float())
-                    # prev_noisy_segmap = vae.decode(prev_noisy_segmap_latents).sample
-                    # pred_noisy_segmap = vae.decode(pred_noisy_segmap_latents).sample
-                    # save_tensor_as_img(prev_noisy_segmap[0], 'prev_noisy_segmap.png', normalized=True)
-                    # save_tensor_as_img(pred_noisy_segmap[0], 'pred_noisy_segmap.png', normalized=True)
-                    mse_loss = F.mse_loss(prev_noisy_segmap_latents.float(), pred_noisy_segmap_latents.float())
-                    loss = mse_loss
+                    
+                    mse_loss = F.mse_loss(prev_noisy_segmap_latents.float(), seg_pred.float())
+                    loss = mse_loss                    
+                    # similarity_labels = torch.matmul(organ_hidden_states, latents.t())
+                    # similarity_logits = torch.matmul(organ_hidden_states, torch.matmul(latents,prev_noisy_segmap_latents.t()).t())
                     # cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
                     # labels = torch.ones(1).to(main_device)
-                    # loss = cosine_sim_loss(seg_pred.view(1,-1).float(), pred_noisy_segmap_latents.view(1,-1).float(), labels)
+                    # sim_loss = cosine_sim_loss(prev_noisy_segmap_latents.view(1,-1).float(), seg_pred.view(1,-1).float(), labels)
+                    
+                    # loss = (mse_loss + sim_loss) / 2
                     # loss = mse_loss.to(main_device)
                     wandb.log({'seg_loss' : loss})
+                    # wandb.log({'mse_loss' : mse_loss})
+                    # wandb.log({'sim_loss' : sim_loss})
                     # wandb.log({'reconstruction_loss' : reconstruction_loss})
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1060,7 +1099,7 @@ def main(args):
                         )
                         filename_text_encoder = f"{args.output_dir}/lora_weight_e{epoch}_s{global_step}.text_encoder.pt"
                         print(f"save weights {filename_unet}, {filename_text_encoder}")
-                        save_lora_weight(pipeline.unet, filename_unet)
+                        save_lora_weight(pipeline.unet, filename_unet, extract_lora_lora=True if args.finetune_unet_segmentation else False)
                         if args.train_text_encoder:
                             save_lora_weight(
                                 pipeline.text_encoder,
@@ -1074,7 +1113,7 @@ def main(args):
                                         ,os.path.join(args.output_dir, f"unet_seg_weights.pt"))
 
 
-                        for _up, _down in extract_lora_ups_down(pipeline.unet):
+                        for _up, _down in extract_lora_ups_down(pipeline.unet, extract_lora_lora=True if args.finetune_unet_segmentation else False):
                             print(
                                 "First Unet Layer's Up Weight is now : ",
                                 _up.weight.data,
@@ -1123,7 +1162,7 @@ def main(args):
         writer.close()
 
         if args.output_format == "pt" or args.output_format == "both":
-            save_lora_weight(pipeline.unet, args.output_dir + "/lora_weight.pt")
+            save_lora_weight(pipeline.unet, args.output_dir + "/lora_weight.pt", extract_lora_lora=True if args.finetune_unet_segmentation else False)
             if args.train_text_encoder:
                 save_lora_weight(
                     pipeline.text_encoder,
@@ -1150,12 +1189,15 @@ def main(args):
             torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
                         'segmentation_head' : segnet.state_dict()}
                         ,os.path.join(args.output_dir,"unet_seg_weights.pt"))
+            torch.save({'unet_weights' : unet.state_dict()}, 
+                        os.path.join(args.output_dir,"entire_finetuned_unet_weights.pt"))
 
     accelerator.end_training()
 
 
 if __name__ == "__main__":
+    # os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
     args = parse_args()
-    torch.cuda.empty_cache()
     main(args)
    
