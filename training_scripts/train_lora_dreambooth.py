@@ -235,20 +235,28 @@ class SegMapDataset(DreamBoothDataset):
         # self.instance_segmap_images_path = list(Path(instance_segmap_data_root).iterdir())
         self.instance_segmap_images_path = [os.path.join(instance_segmap_data_root, os.path.splitext(os.path.basename(path))[0] + '.png') for path in self.instance_images_path]
         # sanity check
-        if (len(self.instance_segmap_images_path) != self.num_instance_images):
-            raise Exception("number of segmaps is different from number of images!")
+        assert len(self.instance_segmap_images_path) == len(self.instance_images_path), "number of segmaps is different from number of images!"
 
         self.instance_segmap_data_root = instance_segmap_data_root
         self.annotations_root = annotations_root
         self.class_annotations = self.__get_class_annotations__()
+        
+        # duplicate paths in instance_segmap_data_root to match the number of class images in class annotations
+        self.instance_segmap_images_path = self.__duplicate_paths_according_to_annotations__(self.instance_segmap_images_path, self.class_annotations)
+        self.instance_images_path = self.__duplicate_paths_according_to_annotations__(self.instance_images_path, self.class_annotations)
+        
+        # combine all lists in class_annotations to a single list
+        merged = list(itertools.chain(*self.class_annotations))
+        self.class_annotations = merged
+        assert len(self.class_annotations) == len(self.instance_segmap_images_path) == len(self.instance_images_path), \
+            "number of class annotations is different from number of segmaps or images!"
+        
+        self.__data_len__ = len(self.instance_segmap_images_path)
+        
         self.voc_png_colormap_dict = get_voc_colormap_png()
         self.voc_rgb_colormap_dict = get_color_map_by_class_rgb()
         self.voc_colormap = color_map()
 
-        # sanity check
-        if (len(self.class_annotations) != self.num_instance_images):
-            raise Exception("number of class annotation is differnet from number of images!")
-        
         img_transforms = []
         segmap_transforms = []
 
@@ -282,7 +290,23 @@ class SegMapDataset(DreamBoothDataset):
         self.segmap_transforms = transforms.Compose(
             [*segmap_transforms]
         )
+        
+    '''
+    self.annotations should be list of lists at this point
+    duplicate each image path in instance images and segmap images to match the number of classes in each correspinding place in class annotations
+    '''
+    def __duplicate_paths_according_to_annotations__(self, img_list, annotations):
+        tmp_img_list = []
+        for i in range(len(annotations)):
+            for j in range(len(annotations[i])):
+                tmp_img_list.append(img_list[i])
+        return tmp_img_list
+        
     
+    '''
+    return list of lists of class annotations for each image
+    that is, each image has a list will all the classes in it
+    '''
     def __get_class_annotations__(self):
         voc_classes = {'background' : 'background',
                     'aeroplane' : 'aeroplane',
@@ -311,11 +335,11 @@ class SegMapDataset(DreamBoothDataset):
     
         annotations = []
         for path in xmls_paths:
-            tree = ET.parse(path)
-            root = tree.getroot()
-            annontation = root.find('object/name')
-
-            annotations += [voc_classes[annontation.text]]
+            tree = ET.parse(path).getroot()
+            objects = tree.findall('object/name')
+            annotations.append(list(set(
+                [voc_classes[object.text] for object in objects if object.text in voc_classes.keys()]
+                )))
 
         return annotations
 
@@ -348,12 +372,12 @@ class SegMapDataset(DreamBoothDataset):
             new_seg_img = new_seg_img.convert('RGB')
 
         return new_seg_img
-
-    def __get_bin_segmap_by_class__(self, img, voc_class):
-        '''
-        Gets png imaage and voc_class
+    
+    '''
+        Gets png image of shape (h,w) and voc_class
         Returns a torch tensor where all pixel that arent the class are (0,0,0) and (255,255,255) for the class
-        '''
+    '''
+    def __get_bin_segmap_by_class__(self, img, voc_class):
         seg_img = np.asarray(img)
         new_seg_img = seg_img.copy()
 
@@ -368,10 +392,9 @@ class SegMapDataset(DreamBoothDataset):
     
     def __getitem__(self, index):
         example = {}
-        img_path = self.instance_images_path[index % self.num_instance_images]
+        img_path = self.instance_images_path[index % self.__data_len__]
         _, img_name = os.path.split(img_path)
         instance_image = Image.open(
-            #self.instance_images_path[index % self.num_instance_images]
             img_path
         )
 
@@ -379,11 +402,11 @@ class SegMapDataset(DreamBoothDataset):
             instance_image = instance_image.convert("RGB")
 
         ## Segmap
-        segmap_img_path = self.instance_segmap_images_path[index % self.num_instance_images]
+        segmap_img_path = self.instance_segmap_images_path[index % self.__data_len__]
         segmap_instance_image = Image.open(segmap_img_path)
         segmap_instance_image = self.segmap_transforms(segmap_instance_image)
 
-        voc_class = self.class_annotations[index % self.num_instance_images]
+        voc_class = self.class_annotations[index % self.__data_len__]
         # segmap_instance_image.save(f'{voc_class}_before.jpeg')
         
         segmap_instance_tensor = self.__get_bin_segmap_by_class__(segmap_instance_image, voc_class)
@@ -416,6 +439,9 @@ class SegMapDataset(DreamBoothDataset):
             ).input_ids
 
         return example
+    
+    def __len__(self):
+        return self.__data_len__
 
 class PromptDataset(Dataset):
     "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
@@ -913,13 +939,13 @@ def main(args):
     # double the channels of the last layer of unet and set them to require_grad_(True)
     n_noise_pred_channels = unet.conv_out.out_channels
     if args.train_unet_segmentation:
-        # tmp = unet.conv_out
-        # new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
-        # new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
+        tmp = unet.conv_out
+        new_layer =  torch.nn.Conv2d(tmp.in_channels, tmp.out_channels * 2, kernel_size=tmp.kernel_size, padding=tmp.padding, bias=True) # Add channels to serve for segmentation
+        new_layer.weight.data[:tmp.weight.data.shape[0], :, :, :] = tmp.weight.data[:, :, :, :]
         
-        # unet.conv_out = new_layer
-        # unet.conv_out.weight.data.requires_grad_(False)
-        # unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
+        unet.conv_out = new_layer
+        unet.conv_out.weight.data.requires_grad_(False)
+        unet.conv_out.weight.data[tmp.out_channels:, :, :, :].requires_grad_(True)
         unet.conv_out.requires_grad_(True)
         # Add a fc layer with softmax to the added channels
         n_features =  4 * 64 * 64
@@ -934,6 +960,12 @@ def main(args):
         # print("Before training: Unet First Layer lora up", _up.weight.data)
         # print("Before training: Unet First Layer lora down", _down.weight.data)
         break
+    
+    if args.resume_unet:
+        # remove base name from args.resume_unet
+        chkpt = torch.load(os.path.join(os.path.dirname(args.resume_unet),"unet_seg_weights.pt"))
+        unet.conv_out.load_state_dict(chkpt['conv_out_state_dict'])
+        unet.conv_out.requires_grad_(True)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -1009,6 +1041,10 @@ def main(args):
                     "params": itertools.chain(*text_encoder_lora_params),
                     "lr": text_lr,
                 },
+                {
+                    "params": itertools.chain(unet.conv_out.parameters()),
+                    "lr": args.learning_rate,
+                }
             ]
             if args.train_text_encoder
             else itertools.chain(unet.conv_out.parameters(), *unet_lora_params)
@@ -1051,6 +1087,7 @@ def main(args):
             center_crop=args.center_crop,
             color_jitter=args.color_jitter,
             resize=args.resize,
+            h_flip=False, # TODO make consisted flip with mask and image
         )
 
     def collate_fn(examples):
@@ -1128,14 +1165,11 @@ def main(args):
         ) = accelerator.prepare(
             unet, text_encoder, optimizer, train_dataloader, lr_scheduler
         )
-    elif not args.train_unet_segmentation:
+    else:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
         )
-    else: # TODO this could probably be deleted
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler,
-        )
+    
     # put all on correct device
     unet.to(unet_device)
     print(f'unet device:{unet.device}')
@@ -1224,7 +1258,7 @@ def main(args):
             latents = latents * 0.18215
 
             if args.instance_segmap_data_root:
-                # save_tensor_as_img(batch['segmap_pixel_values'][0], 'segmap_img.jpeg')
+                # save_tensor_as_img(batch['segmap_pixel_values'][0], 'segmap_img.jpeg', normalized=False)
                 segmap = batch["segmap_pixel_values"].to(main_device, dtype=weight_dtype)
                 segmap_latents = vae.encode(
                     segmap
@@ -1291,21 +1325,32 @@ def main(args):
                 loss = loss + args.prior_loss_weight * prior_loss
             else:
                 if args.train_unet_segmentation:                    
-                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :].to(unet_device) # this is noise
-                    # seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device, dtype=torch.half)
+                    model_pred = unet_pred[:, :n_noise_pred_channels, :, :] # this is noise
+                    seg_pred = unet_pred[:, n_noise_pred_channels:, :, :].to(main_device)
 
-                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(unet_device)
-                    noise_scheduler.betas = noise_scheduler.betas.to(unet_device)
-                    noise_scheduler.alphas = noise_scheduler.alphas.to(unet_device)
+                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(main_device)
+                    noise_scheduler.betas = noise_scheduler.betas.to(main_device)
+                    noise_scheduler.alphas = noise_scheduler.alphas.to(main_device)
+                    noise_scheduler.alphas_cumprod = noise_scheduler.alphas_cumprod.to(main_device)
                     
-                    pred_origin_sample = noise_scheduler.step(model_pred, timesteps, noisy_latents).pred_original_sample.to(main_device, dtype=torch.half)
-                    mse_loss = F.mse_loss(pred_origin_sample.float(), segmap_latents.float())
+                    timesteps = timesteps.to(main_device)
+                    segmap_latents = segmap_latents.to(main_device)
+                    noise.to(main_device)
+                    noisy_segmap_latents = noise_scheduler.add_noise(segmap_latents, noise, timesteps)
+                    noisy_latents = noisy_latents.to(main_device)
+                    prev_noisy_segmap_latents = noise_scheduler.step(noise, timesteps, noisy_segmap_latents).prev_sample
+                    # pred_noisy_segmap_latents = noise_scheduler.step(seg_pred, timesteps, noisy_latents).prev_sample
+                    # reconstruction_loss = F.mse_loss(prev_noisy_segmap_latents.float(),segmap_latents.float())
+                    # prev_noisy_segmap = vae.decode(prev_noisy_segmap_latents).sample
+                    # pred_noisy_segmap = vae.decode(pred_noisy_segmap_latents).sample
+                    # save_tensor_as_img(prev_noisy_segmap[0], 'prev_noisy_segmap.png', normalized=True)
+                    # save_tensor_as_img(pred_noisy_segmap[0], 'pred_noisy_segmap.png', normalized=True)
+                    mse_loss = F.mse_loss(prev_noisy_segmap_latents.float(), seg_pred.float())
+                    loss = mse_loss
                     # cosine_sim_loss = torch.nn.CosineEmbeddingLoss()
                     # labels = torch.ones(1).to(main_device)
-                    # loss = cosine_sim_loss(seg_pred.view(1,-1).float(), segmap_latents.view(1,-1).float(), labels)
-                    # TODO save image of the decoded pred_origin_sample
-                    # decode_latents(pred_origin_sample, vae, './pred_origin_sample.jpeg')
-                    loss = mse_loss
+                    # loss = cosine_sim_loss(segmap_latents.view(1,-1).float(), pred_noisy_segmap_latents.view(1,-1).float(), labels)
+                    # loss = mse_loss.to(main_device)
                     wandb.log({'seg_loss' : loss})
                 else:
                     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -1328,7 +1373,7 @@ def main(args):
             if global_step % 100 == 0:
                 if args.train_unet_segmentation:
                     writer.add_scalar(tag='segmentation loss',
-                        scalar_value=mse_loss,
+                        scalar_value=loss,
                         global_step=global_step)
 
                 else:
@@ -1376,10 +1421,10 @@ def main(args):
                                 target_replace_module=["CLIPAttention"],
                             )
                             
-                        # if args.train_unet_segmentation and loss <= min_loss:
-                        #     torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
-                        #                 'segmentation_head' : segnet.state_dict()}
-                        #                 ,os.path.join(args.output_dir, f"unet_seg_weights_min_loss.pt"))
+                        if args.train_unet_segmentation:
+                            torch.save({'conv_out_state_dict' : unet.conv_out.state_dict(),
+                                        'segmentation_head' : segnet.state_dict()}
+                                        ,os.path.join(args.output_dir, f"unet_seg_weights.pt"))
 
 
                         for _up, _down in extract_lora_ups_down(pipeline.unet):
