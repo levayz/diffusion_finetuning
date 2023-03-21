@@ -454,7 +454,6 @@ def parse_args(input_args=None):
 
     if input_args is not None:
         args = parser.parse_args(input_args)
-        print(args)
     else:
         args = parser.parse_args()
 
@@ -596,6 +595,7 @@ def main(args):
         subfolder="text_encoder",
         revision=args.revision,
     )
+    # TODO make optional
     text_encoder.load_state_dict(torch.load('/disk4/Lev/Projects/diffusion_finetuning/training_scripts/clip_text_encoder_weights.pt',
                                             map_location=torch.device('cpu')))
     print('***Loaded text encoder weights from /disk4/Lev/Projects/diffusion_finetuning/training_scripts/clip_text_encoder_weights.pt***')
