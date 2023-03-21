@@ -5,7 +5,8 @@ export OUTPUT_DIR="./output_example_text"
 
 accelerate launch train_lora_dreambooth.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
-  --instance_data_dir=$INSTANCE_DIR \
+  --instance_data_dir="/disk4/Lev/Projects/diffusion_finetuning/data/original_train" \
+  --instance_segmap_data_root="/disk4/Lev/Projects/diffusion_finetuning/data/bin_seg_maps_train" \
   --output_dir=$OUTPUT_DIR \
   --instance_prompt="game character bnha" \
   --train_text_encoder \
